@@ -209,6 +209,18 @@ wss.on('connection', (ws, req) => {
   });
 });
 
+server.on('error', (err) => {
+  if (err && err.code === 'EADDRINUSE') {
+    console.error('==================================================');
+    console.error(` [启动失败] 端口 ${PORT} 已被占用。`);
+    console.error(' 可能是上一次的服务仍在运行，请先关闭旧窗口，');
+    console.error(' 或改用其他端口启动：set PORT=8081 && npm start');
+    console.error('==================================================');
+    process.exit(1);
+  }
+  throw err;
+});
+
 server.listen(PORT, () => {
   const lanIP = getLanIP();
   console.log('==================================================');
