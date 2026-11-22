@@ -38,15 +38,22 @@ function generateCode() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
-/** 获取本机第一个非内部 IPv4 地址（局域网地址） */
-function getLanIP() {
+/** 获取本机所有非内部 IPv4 地址（Wi-Fi、热点等所有可被外部访问的地址） */
+function getLanIPs() {
   const nets = os.networkInterfaces();
+  const ips = [];
   for (const name of Object.keys(nets)) {
     for (const net of nets[name] || []) {
-      if (net.family === 'IPv4' && !net.internal) return net.address;
+      if (net.family === 'IPv4' && !net.internal) ips.push(net.address);
     }
   }
-  return '127.0.0.1';
+  return ips;
+}
+
+/** 获取本机第一个非内部 IPv4 地址（默认主地址） */
+function getLanIP() {
+  const ips = getLanIPs();
+  return ips.length ? ips[0] : '127.0.0.1';
 }
 
 function sendJSON(ws, obj) {
@@ -77,8 +84,11 @@ function detach(code, role) {
 /* ---------------- HTTP 部分 ---------------- */
 
 async function handleSessionRequest(req, res) {
-  // 电脑端请求新的投屏码
-  const lanIP = getLanIP();
+  // 电脑端请求新的投屏码；可选指定 ip 参数用于指定二维码中的地址
+  const lanIPs = getLanIPs();
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+  const wanted = url.searchParams.get('ip');
+  const lanIP = lanIPs.includes(wanted) ? wanted : getLanIP();
   const code = generateCode();
   sessions.set(code, { computer: null, phone: null, createdAt: Date.now() });
   const castUrl = `http://${lanIP}:${PORT}/cast?code=${code}`;
@@ -89,7 +99,7 @@ async function handleSessionRequest(req, res) {
     color: { dark: '#1f2430', light: '#ffffff' },
   });
   res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-  res.end(JSON.stringify({ code, qr: qrDataUrl, castUrl, lanIP, port: PORT }));
+  res.end(JSON.stringify({ code, qr: qrDataUrl, castUrl, lanIP, lanIPs, port: PORT }));
 }
 
 function serveStatic(req, res, urlPath) {
