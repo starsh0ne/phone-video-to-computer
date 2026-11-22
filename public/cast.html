@@ -217,10 +217,10 @@
 
   <div class="card">
     <ul class="tips">
-      <li>微信扫码会在内置浏览器中打开（不支持屏幕采集），请点右上角「···」→「在浏览器中打开」，用 Chrome 打开后再投屏</li>
+      <li>支持 Chrome、Edge、百度浏览器、vivo 浏览器等 Chromium 内核浏览器，可直接投屏</li>
+      <li>微信内置浏览器（X5 内核）不支持屏幕采集，请点右上角「···」→「在浏览器中打开」，选择上述浏览器</li>
       <li>点击「开始投屏」后，系统会弹出屏幕采集授权，请选择「整个屏幕」并确认</li>
       <li>授权后即可把手机画面（含红果、抖音、B站等任意 App）实时投到电脑</li>
-      <li>建议使用 Chrome 浏览器以获得最佳兼容性</li>
     </ul>
   </div>
 
@@ -250,21 +250,50 @@
   }
   function hideError() { $('error-box').classList.remove('show'); }
 
+  /** 识别浏览器内核（基于 UA），用于给出针对性引导 */
+  function detectBrowser() {
+    const ua = navigator.userAgent || '';
+    const isIos = /iPhone|iPad|iPod/i.test(ua);
+    // X5/TBS 内核：微信、QQ 内置浏览器（UA 带 MicroMessenger / MQQBrowser / X5 标记）
+    if (/micromessenger|mqqbrowser|x5\/|tbs\b/i.test(ua)) {
+      return { kernel: 'x5', isIos, label: '微信/QQ 内置浏览器' };
+    }
+    if (/edge|edg\/|edga\//i.test(ua)) return { kernel: 'chromium', isIos, label: 'Edge' };
+    if (/baidubrowser|baiduboxapp/i.test(ua)) return { kernel: 'chromium', isIos, label: '百度浏览器' };
+    if (/vivobrowser/i.test(ua)) return { kernel: 'chromium', isIos, label: 'vivo 浏览器' };
+    if (/ucbrowser/i.test(ua)) return { kernel: 'chromium', isIos, label: 'UC 浏览器' };
+    if (/chrome\//i.test(ua)) return { kernel: 'chromium', isIos, label: 'Chrome' };
+    if (/firefox|fxios/i.test(ua)) return { kernel: 'gecko', isIos, label: 'Firefox' };
+    if (isIos) return { kernel: 'webkit', isIos, label: 'Safari' };
+    return { kernel: 'unknown', isIos, label: '当前浏览器' };
+  }
+
   /** 检测当前浏览器是否支持屏幕采集，返回结果与针对性引导文案 */
   function checkSupport() {
     const hasDisplayMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
-    if (hasDisplayMedia) return { ok: true };
-    const ua = navigator.userAgent || '';
-    const isWechat = /micromessenger/i.test(ua);
-    if (isWechat) {
+    const browser = detectBrowser();
+    if (hasDisplayMedia) return { ok: true, browser };
+    if (browser.kernel === 'x5') {
       return {
-        ok: false,
-        guide: '微信内置浏览器不支持屏幕采集。请在当前页面点击右上角「···」（更多），选择「在浏览器中打开」，用 Chrome 打开本页后即可正常投屏。',
+        ok: false, browser,
+        guide: '微信/QQ 内置浏览器（X5 内核）不支持屏幕采集。请点右上角「···」→「在浏览器中打开」，选择 Chrome / Edge / 百度浏览器等打开本页，即可正常投屏。',
+      };
+    }
+    if (browser.isIos) {
+      return {
+        ok: false, browser,
+        guide: 'iOS 系统的 Safari 与微信暂不支持屏幕采集接口，无法投屏。建议改用 Android 手机，使用 Chrome / Edge / 百度浏览器 / vivo 浏览器打开本页。',
+      };
+    }
+    if (browser.kernel === 'chromium') {
+      return {
+        ok: false, browser,
+        guide: '当前浏览器为 Chromium 内核（已识别：' + browser.label + '），理论上支持投屏，但当前版本未启用屏幕采集接口。请升级浏览器至最新版后重试，或点击下方链接复制，粘贴到 Chrome / Edge 中打开。',
       };
     }
     return {
-      ok: false,
-      guide: '当前浏览器不支持屏幕采集（getDisplayMedia）。请使用 Chrome 浏览器打开本页面。可点击下方链接复制后，粘贴到 Chrome 中打开。',
+      ok: false, browser,
+      guide: '当前浏览器不支持屏幕采集（getDisplayMedia）。推荐使用 Chrome、Edge、百度浏览器或 vivo 浏览器（均为 Chromium 内核）打开本页。可点击下方链接复制后粘贴到浏览器中打开。',
     };
   }
 
@@ -304,10 +333,11 @@
       showError(support.guide);
       $('copy-row').classList.add('show');
       setupCopyRow();
-      setStatus('浏览器不支持屏幕采集', 'bad');
+      setStatus('浏览器不支持：' + support.browser.label, 'bad');
       $('btn-cast').disabled = true;
       return;
     }
+    setStatus('已识别：' + support.browser.label + '，连接信令服务…', '');
 
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     ws = new WebSocket(`${proto}://${location.host}/ws`);
@@ -360,7 +390,7 @@
       showError(support.guide);
       $('copy-row').classList.add('show');
       setupCopyRow();
-      setStatus('浏览器不支持', 'bad');
+      setStatus('浏览器不支持：' + support.browser.label, 'bad');
       $('btn-cast').disabled = false;
       return;
     }
@@ -372,6 +402,14 @@
     } catch (err) {
       showError('未获得屏幕采集授权，请在系统弹窗中选择「整个屏幕」并点击「开始/确定」。');
       setStatus('授权被拒绝', 'bad');
+      $('btn-cast').disabled = false;
+      return;
+    }
+
+    // 部分国产 Chromium 浏览器 API 存在但采集不到画面，做兜底校验
+    if (!localStream.getVideoTracks().length) {
+      showError('屏幕采集未返回画面（当前浏览器：' + detectBrowser().label + '）。请升级浏览器至最新版，或换用 Chrome / Edge 打开本页重试。');
+      setStatus('采集无画面', 'bad');
       $('btn-cast').disabled = false;
       return;
     }
