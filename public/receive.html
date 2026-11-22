@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>投屏接收端 · local-cast</title>
+<style>
+  :root {
+    --paper: #f7f3ea;
+    --paper-2: #fdfbf6;
+    --grid: #e3d9c3;
+    --ink: #1f2430;
+    --ink-2: #4a5060;
+    --ink-3: #8a8f9c;
+    --accent: #2f6f5f;
+    --accent-2: #c9b38a;
+    --danger: #b04a3f;
+    --line: #d8cdB8;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--paper);
+    background-image:
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+    background-size: 28px 28px;
+    color: var(--ink);
+    padding: 28px;
+    display: flex;
+    justify-content: center;
+    min-height: 100vh;
+  }
+  .app {
+    width: 100%;
+    max-width: 1200px;
+    display: grid;
+    grid-template-columns: 1fr 340px;
+    gap: 24px;
+    align-items: stretch;
+  }
+
+  /* ---------- 左栏：画面显示 ---------- */
+  .stage {
+    background: var(--paper-2);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 18px;
+    display: flex;
+    flex-direction: column;
+    min-height: 420px;
+  }
+  .stage-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 14px;
+  }
+  .stage-title { font-size: 15px; font-weight: 600; letter-spacing: .06em; color: var(--ink-2); }
+  .stage-title::before { content: "▶ "; color: var(--accent); }
+  .stage-actions { display: flex; gap: 8px; }
+  .stage-actions button {
+    border: 1px solid var(--line);
+    background: var(--paper);
+    color: var(--ink-2);
+    padding: 6px 12px;
+    border-radius: 8px;
+    font-size: 13px;
+    cursor: pointer;
+    transition: all .15s ease;
+  }
+  .stage-actions button:hover:not(:disabled) { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .stage-actions button:disabled { opacity: .4; cursor: not-allowed; }
+
+  .screen-wrap {
+    position: relative;
+    flex: 1;
+    background: #101318;
+    border-radius: 10px;
+    overflow: hidden;
+    min-height: 320px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  #screen { width: 100%; height: 100%; object-fit: contain; display: none; background: #101318; }
+  .screen-wrap.live #screen { display: block; }
+
+  .placeholder { text-align: center; color: #6b7280; padding: 30px; }
+  .placeholder .ph-icon { font-size: 44px; margin-bottom: 12px; opacity: .5; }
+  .placeholder .ph-text { font-size: 14px; line-height: 1.9; }
+  .placeholder .ph-text b { color: var(--ink-2); }
+
+  .stage-foot { margin-top: 12px; font-size: 12px; color: var(--ink-3); display: flex; justify-content: space-between; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--ink-3); vertical-align: 1px; }
+  .dot.live { background: var(--accent); animation: pulse 1.6s infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+
+  /* ---------- 右栏：投屏码 / 二维码 ---------- */
+  .panel {
+    background: var(--paper-2);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 22px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  .panel-title { font-size: 13px; font-weight: 600; letter-spacing: .1em; color: var(--ink-2); }
+  .code-box {
+    border: 2px dashed var(--accent-2);
+    border-radius: 12px;
+    padding: 16px;
+    text-align: center;
+    background: var(--paper);
+  }
+  .code-label { font-size: 12px; color: var(--ink-3); margin-bottom: 6px; letter-spacing: .08em; }
+  .code-value {
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 38px;
+    font-weight: 700;
+    letter-spacing: .22em;
+    color: var(--ink);
+    user-select: all;
+  }
+  .qr-box { text-align: center; }
+  .qr-box img { width: 220px; height: 220px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
+  .qr-tip { font-size: 12px; color: var(--ink-3); margin-top: 8px; line-height: 1.7; }
+
+  .status-card { border-top: 1px solid var(--line); padding-top: 14px; }
+  .status-row { display: flex; align-items: center; font-size: 13px; padding: 5px 0; color: var(--ink-2); }
+  .status-row .k { width: 76px; color: var(--ink-3); font-size: 12px; }
+  .status-row .v { flex: 1; word-break: break-all; }
+  .status-row .v.ok { color: var(--accent); font-weight: 600; }
+  .status-row .v.bad { color: var(--danger); font-weight: 600; }
+
+  .refresh-btn {
+    margin-top: 4px;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: #fff;
+    padding: 9px 0;
+    border-radius: 9px;
+    font-size: 14px;
+    cursor: pointer;
+    transition: opacity .15s ease;
+  }
+  .refresh-btn:hover { opacity: .85; }
+
+  @media (max-width: 860px) {
+    .app { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- 左栏：投屏画面 -->
+  <section class="stage">
+    <div class="stage-head">
+      <span class="stage-title">投屏画面</span>
+      <div class="stage-actions">
+        <button id="btn-mute" disabled>🔊 声音</button>
+        <button id="btn-full" disabled>⛶ 全屏</button>
+        <button id="btn-stop" disabled>停止投屏</button>
+      </div>
+    </div>
+    <div class="screen-wrap" id="screen-wrap">
+      <video id="screen" autoplay playsinline></video>
+      <div class="placeholder" id="placeholder">
+        <div class="ph-icon">🖥️</div>
+        <div class="ph-text">
+          等待手机投屏中……<br>
+          请用手机扫描右侧<b>二维码</b>，或输入<b>投屏码</b>连接
+        </div>
+      </div>
+    </div>
+    <div class="stage-foot">
+      <span><span class="dot" id="dot"></span><span id="state-text">初始化中</span></span>
+      <span id="stat-text">—</span>
+    </div>
+  </section>
+
+  <!-- 右栏：投屏码与二维码 -->
+  <aside class="panel">
+    <div>
+      <div class="panel-title">连接方式</div>
+      <div class="code-box" style="margin-top:10px">
+        <div class="code-label">投 屏 码</div>
+        <div class="code-value" id="code">------</div>
+      </div>
+    </div>
+    <div class="qr-box">
+      <img id="qr" alt="投屏二维码" src="">
+      <div class="qr-tip">用手机（微信 / 相机等）扫码，<br>自动打开投屏页并连接本机</div>
+    </div>
+    <div class="status-card">
+      <div class="status-row"><span class="k">服务地址</span><span class="v" id="info-url">—</span></div>
+      <div class="status-row"><span class="k">信令状态</span><span class="v" id="info-ws">连接中…</span></div>
+      <div class="status-row"><span class="k">投屏状态</span><span class="v" id="info-cast">待连接</span></div>
+      <div class="status-row"><span class="k">接收帧率</span><span class="v" id="info-fps">—</span></div>
+      <button class="refresh-btn" id="btn-refresh">重新生成投屏码</button>
+    </div>
+  </aside>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  const $ = (id) => document.getElementById(id);
+  const video = $('screen');
+  const placeholder = $('placeholder');
+  const screenWrap = $('screen-wrap');
+
+  let ws = null;
+  let pc = null;
+  let localOfferSdp = null;
+  let fpsTimer = null, fpsCount = 0, fpsTime = 0;
+
+  function setState(text, live) {
+    $('state-text').textContent = text;
+    $('dot').classList.toggle('live', !!live);
+  }
+  function setWs(text, cls) {
+    const el = $('info-ws');
+    el.textContent = text;
+    el.className = 'v' + (cls ? ' ' + cls : '');
+  }
+  function setCast(text, cls) {
+    const el = $('info-cast');
+    el.textContent = text;
+    el.className = 'v' + (cls ? ' ' + cls : '');
+  }
+
+  /** 建立信令 WebSocket */
+  function connectSignaling() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.onopen = () => { setWs('已连接', 'ok'); join(); };
+    ws.onclose = () => { setWs('已断开', 'bad'); setCast('连接中断，正在重连…', 'bad'); setState('重连中', false); setTimeout(connectSignaling, 2000); };
+    ws.onerror = () => setWs('异常', 'bad');
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      switch (msg.type) {
+        case 'joined':
+          setCast('已就位，等待手机', '');
+          break;
+        case 'waiting':
+          setCast('已就位，等待手机', '');
+          break;
+        case 'peer-ready':
+          setCast('手机已连接，协商中…', '');
+          setState('协商中', false);
+          break;
+        case 'peer-left':
+          cleanupStream('手机已断开投屏');
+          setCast('手机已断开', '');
+          break;
+        case 'signal':
+          handleSignal(msg.from, msg.data);
+          break;
+        case 'error':
+          setCast(msg.message, 'bad');
+          break;
+      }
+    };
+  }
+
+  function join() {
+    const code = $('code').textContent.trim();
+    if (!/^\d{6}$/.test(code)) return;
+    send({ type: 'join', role: 'computer', code });
+  }
+
+  function send(obj) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  }
+
+  function ensurePC() {
+    if (pc) return pc;
+    pc = new RTCPeerConnection({ iceServers: [] });
+    pc.ontrack = (ev) => {
+      video.srcObject = ev.streams[0];
+      video.play().catch(() => {});
+      screenWrap.classList.add('live');
+      placeholder.style.display = 'none';
+      $('btn-mute').disabled = false;
+      $('btn-full').disabled = false;
+      $('btn-stop').disabled = false;
+      startFpsMeter();
+      setCast('投屏中', 'ok');
+      setState('投屏中', true);
+      $('stat-text').textContent = '视频已接收';
+    };
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate) send({ type: 'signal', from: 'computer', data: { candidate: ev.candidate.toJSON() } });
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+        cleanupStream('连接中断');
+        setCast('连接中断', 'bad');
+        setState('中断', false);
+      }
+    };
+    return pc;
+  }
+
+  function handleSignal(from, data) {
+    const p = ensurePC();
+    if (data.sdp) {
+      if (data.sdp.type === 'offer') {
+        p.setRemoteDescription(data.sdp)
+          .then(() => p.createAnswer())
+          .then((answer) => p.setLocalDescription(answer))
+          .then(() => send({ type: 'signal', from: 'computer', data: { sdp: p.localDescription } }))
+          .catch((err) => console.error('[offer] 处理失败:', err));
+      } else if (data.sdp.type === 'answer' && localOfferSdp) {
+        p.setRemoteDescription(data.sdp).catch((err) => console.error('[answer] 处理失败:', err));
+        localOfferSdp = null;
+      }
+    } else if (data.candidate) {
+      p.addIceCandidate(data.candidate).catch(() => {});
+    }
+  }
+
+  function startFpsMeter() {
+    stopFpsMeter();
+    fpsCount = 0; fpsTime = performance.now();
+    fpsTimer = setInterval(() => {
+      const now = performance.now();
+      const sec = (now - fpsTime) / 1000;
+      const fps = sec > 0 ? Math.round(fpsCount / sec) : 0;
+      $('info-fps').textContent = fps + ' fps';
+      $('stat-text').textContent = video.videoWidth + '×' + video.videoHeight;
+      fpsCount = 0; fpsTime = now;
+    }, 1000);
+    if (video.requestVideoFrameCallback) {
+      const cb = () => { fpsCount++; video.requestVideoFrameCallback(cb); };
+      video.requestVideoFrameCallback(cb);
+    } else {
+      // 退化方案：按播放时间粗估
+      fpsTimer2 = setInterval(() => { fpsCount += 30; }, 1000);
+    }
+  }
+  let fpsTimer2 = null;
+  function stopFpsMeter() {
+    if (fpsTimer) clearInterval(fpsTimer);
+    if (fpsTimer2) clearInterval(fpsTimer2);
+    fpsTimer = null; fpsTimer2 = null;
+  }
+
+  function cleanupStream(reason) {
+    stopFpsMeter();
+    try { if (video.srcObject) video.srcObject.getTracks().forEach((t) => t.stop()); } catch {}
+    video.srcObject = null;
+    screenWrap.classList.remove('live');
+    placeholder.style.display = '';
+    $('btn-mute').disabled = true;
+    $('btn-full').disabled = true;
+    $('btn-stop').disabled = true;
+    $('video').muted = false;
+    $('btn-mute').textContent = '🔊 声音';
+    $('info-fps').textContent = '—';
+    $('stat-text').textContent = '—';
+    if (pc) { try { pc.close(); } catch {} pc = null; }
+  }
+
+  /* ---------- 按钮 ---------- */
+  $('btn-stop').onclick = () => {
+    send({ type: 'leave' });
+    cleanupStream('已手动停止');
+    setCast('已停止', '');
+    setState('已停止', false);
+  };
+  $('btn-full').onclick = () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else screenWrap.requestFullscreen().catch(() => {});
+  };
+  $('btn-mute').onclick = () => {
+    video.muted = !video.muted;
+    $('btn-mute').textContent = video.muted ? '🔇 静音' : '🔊 声音';
+  };
+  $('btn-refresh').onclick = () => initSession(true);
+
+  /* ---------- 会话初始化 ---------- */
+  async function initSession(showToast) {
+    try {
+      const resp = await fetch('/api/session');
+      const data = await resp.json();
+      if (data.error) throw new Error(data.error);
+      $('code').textContent = data.code;
+      $('qr').src = data.qr;
+      $('info-url').textContent = data.castUrl;
+      $('stat-text').textContent = '投屏码已生成';
+      setCast('等待连接', '');
+      if (showToast) setCast('已重新生成投屏码', '');
+      // 会话变化后重新加入信令
+      if (ws && ws.readyState === WebSocket.OPEN) join();
+    } catch (err) {
+      setCast('获取投屏码失败：' + err.message, 'bad');
+    }
+  }
+
+  initSession(false);
+  connectSignaling();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>手机投屏 · local-cast</title>
+<style>
+  :root {
+    --paper: #f7f3ea;
+    --paper-2: #fdfbf6;
+    --grid: #e6dcC3;
+    --ink: #1f2430;
+    --ink-2: #4a5060;
+    --ink-3: #8a8f9c;
+    --accent: #2f6f5f;
+    --accent-soft: #e4efe9;
+    --danger: #b04a3f;
+    --line: #ddd3bc;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body {
+    font-family: "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    background: var(--paper);
+    background-image:
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+    background-size: 24px 24px;
+    color: var(--ink);
+    display: flex;
+    justify-content: center;
+    min-height: 100vh;
+  }
+  .app {
+    width: 100%;
+    max-width: 480px;
+    padding: 24px 20px 40px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+
+  .header { text-align: center; padding: 6px 0 2px; }
+  .header .logo { font-size: 26px; }
+  .header h1 { font-size: 19px; letter-spacing: .08em; margin-top: 6px; }
+  .header .sub { font-size: 12px; color: var(--ink-3); margin-top: 4px; }
+
+  .card {
+    background: var(--paper-2);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 18px;
+  }
+
+  /* 投屏码回显 */
+  .code-line {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    background: var(--accent-soft);
+    border-radius: 10px;
+    font-size: 13px;
+  }
+  .code-line .label { color: var(--ink-2); }
+  .code-line .code {
+    font-family: Consolas, monospace;
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: .12em;
+    color: var(--accent);
+  }
+
+  /* 状态区 */
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 14px;
+  }
+  .status .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--ink-3); flex-shrink: 0;
+  }
+  .status .dot.live { background: var(--accent); animation: pulse 1.4s infinite; }
+  .status .dot.bad { background: var(--danger); }
+  @keyframes pulse { 50% { opacity: .3; } }
+
+  /* 主按钮 */
+  .btn-cast {
+    width: 100%;
+    border: none;
+    background: var(--accent);
+    color: #fff;
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: .15em;
+    padding: 15px 0;
+    border-radius: 12px;
+    cursor: pointer;
+    transition: opacity .15s ease, transform .1s ease;
+  }
+  .btn-cast:active { transform: scale(.98); }
+  .btn-cast:disabled { opacity: .45; cursor: not-allowed; }
+
+  .btn-stop {
+    width: 100%;
+    border: 1px solid var(--danger);
+    background: transparent;
+    color: var(--danger);
+    font-size: 15px;
+    padding: 12px 0;
+    border-radius: 12px;
+    cursor: pointer;
+  }
+  .btn-stop:disabled { opacity: .4; cursor: not-allowed; }
+
+  .tips { font-size: 12px; color: var(--ink-3); line-height: 1.8; }
+  .tips li { margin-left: 16px; }
+
+  .error-box {
+    display: none;
+    background: #fbeaea;
+    border: 1px solid #ecc7c2;
+    color: var(--danger);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  .error-box.show { display: block; }
+
+  /* 投屏中的预览条 */
+  .preview {
+    display: none;
+    width: 100%;
+    aspect-ratio: 9 / 16;
+    max-height: 340px;
+    background: #101318;
+    border-radius: 10px;
+    object-fit: contain;
+  }
+  .preview.show { display: block; }
+
+  .foot { text-align: center; font-size: 11px; color: var(--ink-3); letter-spacing: .05em; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="header">
+    <div class="logo">📱</div>
+    <h1>手机投屏</h1>
+    <div class="sub">已连接电脑端 · local-cast</div>
+  </div>
+
+  <div class="card">
+    <div class="code-line">
+      <span class="label">投屏目标</span>
+      <span class="code" id="code">------</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="status">
+      <span class="dot" id="dot"></span>
+      <span id="status-text">正在连接信令服务…</span>
+    </div>
+  </div>
+
+  <div class="error-box" id="error-box"></div>
+
+  <video class="preview" id="preview" autoplay playsinline muted></video>
+
+  <div class="card">
+    <button class="btn-cast" id="btn-cast" disabled>开 始 投 屏</button>
+    <button class="btn-stop" id="btn-stop" style="margin-top:10px" disabled>停 止 投 屏</button>
+  </div>
+
+  <div class="card">
+    <ul class="tips">
+      <li>点击「开始投屏」后，系统会弹出屏幕采集授权，请选择「整个屏幕」并确认</li>
+      <li>授权后即可把手机画面（含红果、抖音、B站等任意 App）实时投到电脑</li>
+      <li>建议使用 Chrome 浏览器以获得最佳兼容性</li>
+    </ul>
+  </div>
+
+  <div class="foot">local-cast · 本地局域网投屏</div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  const $ = (id) => document.getElementById(id);
+  const params = new URLSearchParams(location.search);
+  const code = (params.get('code') || '').trim();
+
+  let ws = null;
+  let pc = null;
+  let localStream = null;
+
+  function setStatus(text, state) {
+    $('status-text').textContent = text;
+    $('dot').className = 'dot' + (state ? ' ' + state : '');
+  }
+  function showError(text) {
+    const box = $('error-box');
+    box.textContent = text;
+    box.classList.add('show');
+  }
+  function hideError() { $('error-box').classList.remove('show'); }
+
+  function send(obj) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  }
+
+  /* ---------- 信令连接 ---------- */
+  function connect() {
+    if (!/^\d{6}$/.test(code)) {
+      setStatus('缺少有效的投屏码', 'bad');
+      showError('二维码或链接中未包含有效投屏码。请回到电脑端重新打开接收页，再扫描新的二维码。');
+      $('btn-cast').disabled = true;
+      return;
+    }
+    $('code').textContent = code;
+
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+    ws.onopen = () => {
+      send({ type: 'join', role: 'phone', code });
+      setStatus('已加入，等待电脑端确认…', '');
+    };
+    ws.onclose = () => {
+      setStatus('信令断开，正在重连…', 'bad');
+      setTimeout(connect, 2000);
+    };
+    ws.onerror = () => setStatus('信令连接异常', 'bad');
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      switch (msg.type) {
+        case 'joined':
+          setStatus('已就位，可开始投屏', '');
+          $('btn-cast').disabled = false;
+          break;
+        case 'waiting':
+          setStatus('已就位，等待电脑端就绪…', '');
+          $('btn-cast').disabled = false;
+          break;
+        case 'peer-ready':
+          setStatus('电脑端已就绪，可以投屏了', '');
+          $('btn-cast').disabled = false;
+          break;
+        case 'signal':
+          handleSignal(msg.from, msg.data);
+          break;
+        case 'error':
+          showError(msg.message);
+          setStatus('连接失败', 'bad');
+          break;
+      }
+    };
+  }
+
+  /* ---------- WebRTC：手机端为发送方 ---------- */
+  async function startCast() {
+    hideError();
+    setStatus('请求屏幕采集授权…', '');
+    $('btn-cast').disabled = true;
+
+    // 1. 系统屏幕采集授权
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      showError('当前浏览器不支持屏幕采集（getDisplayMedia）。请使用 Chrome 浏览器打开本页面。');
+      setStatus('浏览器不支持', 'bad');
+      $('btn-cast').disabled = false;
+      return;
+    }
+    try {
+      localStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: 30 },
+        audio: false,
+      });
+    } catch (err) {
+      showError('未获得屏幕采集授权，请在系统弹窗中选择「整个屏幕」并点击「开始/确定」。');
+      setStatus('授权被拒绝', 'bad');
+      $('btn-cast').disabled = false;
+      return;
+    }
+
+    // 用户在系统录制控件里手动停止时的处理
+    localStream.getVideoTracks().forEach((t) => {
+      t.onended = () => stopCast(true);
+    });
+
+    // 2. 建立 WebRTC 连接（手机端发起 offer）
+    setStatus('建立投屏通道…', '');
+    pc = new RTCPeerConnection({ iceServers: [] });
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate) send({ type: 'signal', from: 'phone', data: { candidate: ev.candidate.toJSON() } });
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') {
+        setStatus('投屏中 · 画面实时传输', 'live');
+      } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+        setStatus('投屏通道中断', 'bad');
+        stopCast(true);
+      }
+    };
+
+    localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    send({ type: 'signal', from: 'phone', data: { sdp: pc.localDescription } });
+
+    // 本地预览
+    $('preview').srcObject = localStream;
+    $('preview').classList.add('show');
+    $('btn-stop').disabled = false;
+  }
+
+  function handleSignal(from, data) {
+    if (!pc) return;
+    if (data.sdp && data.sdp.type === 'answer') {
+      pc.setRemoteDescription(data.sdp).catch((err) => console.error('[answer] 处理失败:', err));
+    } else if (data.candidate) {
+      pc.addIceCandidate(data.candidate).catch(() => {});
+    }
+  }
+
+  function stopCast(auto) {
+    $('preview').classList.remove('show');
+    $('preview').srcObject = null;
+    try { if (localStream) localStream.getTracks().forEach((t) => t.stop()); } catch {}
+    localStream = null;
+    if (pc) { try { pc.close(); } catch {} pc = null; }
+    $('btn-stop').disabled = true;
+    $('btn-cast').disabled = false;
+    if (auto) {
+      setStatus('投屏已结束', '');
+      send({ type: 'leave' });
+    }
+  }
+
+  /* ---------- 按钮 ---------- */
+  $('btn-cast').onclick = startCast;
+  $('btn-stop').onclick = () => stopCast(false);
+
+  connect();
+})();
+</script>
+</body>
+</html>
