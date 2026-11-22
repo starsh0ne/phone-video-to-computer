@@ -1,0 +1,20 @@
+{
+  "name": "local-cast",
+  "version": "0.1.0",
+  "description": "本地开源投屏工具：手机投屏到电脑，支持投屏码/二维码连接，同一局域网 WebRTC 点对点直连",
+  "main": "server/server.js",
+  "scripts": {
+    "start": "node server/server.js",
+    "test": "node test/e2e.test.js"
+  },
+  "keywords": [
+    "cast",
+    "webrtc",
+    "screen-mirror",
+    "local"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
