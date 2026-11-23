@@ -1604,20 +1604,28 @@ self.onmessage = (e) => {
         $('info-fps').textContent = fps + ' fps (无线)';
         $('stat-text').textContent = canvasEl.width + '×' + canvasEl.height;
         frameCount = 0; fpsTime = now;
-        // ---- 卡屏看门狗（v0.6.3）----
+        // ---- 卡屏看门狗（v0.6.4 提速：停摆到恢复 ≤5s）----
         // ① 有视频数据但 2.5s 不出帧：浏览器解码器停摆（硬件解码偶发卡死且无错误回调）→ 强制重建
         if (decoder && configured && !keyChunkNeeded && lastVideoDataTime &&
             now - lastVideoDataTime < 1500 && now - lastPaintTime > 2500 &&
             now - lastRebuildAt > 8000) {
           forceDecoderRebuild(now);
         }
-        // ② 音频正常但 8s 完全没有视频数据：手机端视频编码器停摆（scrcpy 进程还活着）→
-        //    通知服务端自动重启采集会话（客户端 60s 只报一次）
+        // ② 音频正常但 3.5s 完全没有视频数据：手机端编码器停摆（scrcpy 进程还活着）→
+        //    通知服务端重启采集会话（新会话秒发关键帧，约 3s 恢复；客户端 45s 只报一次）
         else if (ws && ws.readyState === WebSocket.OPEN && lastAudioDataTime &&
             now - lastAudioDataTime < 3000 && lastVideoDataTime &&
-            now - lastVideoDataTime > 8000 && now - lastStallNotify > 60000) {
+            now - lastVideoDataTime > 3500 && now - lastStallNotify > 45000) {
           lastStallNotify = now;
           log('⚠ 视频流停滞（音频正常），已请求服务端重启采集…');
+          try { ws.send(JSON.stringify({ type: 'video-stall' })); } catch {}
+        }
+        // ③ ①已重建过但 6.5s 仍不出帧（关键帧迟迟不到/重建无效）→ 升级为重启采集会话
+        else if (ws && ws.readyState === WebSocket.OPEN && lastRebuildAt &&
+            lastAudioDataTime && now - lastAudioDataTime < 3000 &&
+            now - lastPaintTime > 6500 && now - lastStallNotify > 45000) {
+          lastStallNotify = now;
+          log('⚠ 解码器重建后画面仍未恢复，升级为重启采集会话…');
           try { ws.send(JSON.stringify({ type: 'video-stall' })); } catch {}
         }
       }, 1000);

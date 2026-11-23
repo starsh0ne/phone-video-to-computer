@@ -385,9 +385,16 @@ class WirelessSession {
         return;
       }
       this.serial = await adbapi.connect(adbPath, addr);
-      connStore.save(addr); // 记住本次成功连接的地址，下次自动回填/重连
+      connStore.save(addr); // 只记住最近一次成功地址（覆盖式，旧端口不残留）
       this.setState('ready', '已连接：' + this.serial + '，可以开始投屏');
     } catch (err) {
+      // 缓存地址失效（无线调试重启后端口会变）→ 自动用 mDNS 发现当前可用地址，免去手动重输
+      if (addr) {
+        this.log('地址 ' + addr + ' 连接失败（' + (err.message || err) + '），自动发现当前地址…');
+        try {
+          if (await this.tryAutoConnect(2)) return;
+        } catch { /* 发现也失败：抛出原错误 */ }
+      }
       this.setState('idle', '连接失败');
       throw err;
     }
@@ -416,6 +423,9 @@ class WirelessSession {
         const wireless = list.find((s) => adbapi.isWirelessSerial(s));
         if (wireless) {
           this.serial = wireless;
+          if (/^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(wireless)) {
+            connStore.save(wireless); // v0.6.4：这条路径也要覆盖保存——否则旧端口永远残留，回填一直是失效地址
+          }
           this.setState('ready', '已连接：' + this.serial + '，可以开始投屏');
           return true;
         }

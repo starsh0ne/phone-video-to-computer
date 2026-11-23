@@ -204,6 +204,9 @@ function startScrcpyServer(adbPath, serial, serverVersion, options = {}) {
   ];
   if (maxSize > 0) args.push(`max_size=${maxSize}`);
   if (maxFps > 0) args.push(`max_fps=${maxFps}`);
+  // v0.6.4：投屏期间持有亮屏唤醒锁，减少手机系统省电策略冻结采集进程/熄屏导致的流中断
+  // （vivo 等厂商对后台进程管控激进；熄屏时画面采集停摆、音频退化为静音包，正是日志里观察到的停摆形态）
+  args.push('stay_awake=true');
   const child = spawn(adbPath, args, { windowsHide: true });
   let stopped = false;
   return {
