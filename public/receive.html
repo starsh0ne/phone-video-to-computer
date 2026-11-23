@@ -988,6 +988,23 @@
         try { ws.send(JSON.stringify({ type: 'client-log', message: 'audio: ' + message })); } catch {}
       }
     }
+
+    // ---- 手机端「正在出声」检测：解码电平滚动窗口（约 500ms）峰值 ----
+    // 用于区分「视频停滞」与「手机端暂停/画面静止」（后者 scrcpy 不产帧是正常现象，不能当停滞重启）
+    let audioLivePeak = 0;      // 最近窗口峰值（f32 线性幅度）
+    let audioLivePeakAt = 0;    // 窗口提交时刻
+    let audioLiveWinPeak = 0;
+    let audioLiveWinFrames = 0;
+    let lastIdleHintAt = 0;     // 最近一次「待机」提示时刻（10s 限频）
+    function noteAudioLevel(peak) {
+      audioLiveWinPeak = Math.max(audioLiveWinPeak, peak || 0);
+      if (++audioLiveWinFrames >= 25) { // 25 帧 × 20ms = 500ms 窗口
+        audioLivePeak = audioLiveWinPeak;
+        audioLivePeakAt = performance.now();
+        audioLiveWinPeak = 0;
+        audioLiveWinFrames = 0;
+      }
+    }
     const SAMPLE_RATE = 48000;
     const FRAME_DURATION_US = 20000; // scrcpy Opus 帧长 20ms
     // ---- 播放排程参数（AudioWorklet 环形缓冲）----
@@ -1086,6 +1103,8 @@ let outPort = null; // worklet 直连端口（init 时收到）
 let feedCount = 0;
 let peak = 0;
 let decodeCount = 0;
+let levelPeak = 0;   // 500ms 窗口峰值累计
+let levelCount = 0;  // 窗口内帧数
 let silenceChecked = false;
 const SR = 48000;
 const FRAME_US = 20000;
@@ -1137,6 +1156,11 @@ self.onmessage = (e) => {
               audioData.copyTo(interleaved, { planeIndex: 0 });
             }
             audioData.close();
+            // 持续音频电平（500ms 窗口峰值）上报：主线程据此区分「手机在播」与「暂停/静止」
+            let lp = 0;
+            for (let i = 0; i < interleaved.length; i++) { const a = Math.abs(interleaved[i]); if (a > lp) lp = a; }
+            levelPeak = Math.max(levelPeak, lp);
+            if (++levelCount >= 25) { post('level', { peak: levelPeak }); levelPeak = 0; levelCount = 0; }
             decodeCount++;
             if (decodeCount === 1) post('log', { message: '首帧解码成功（worker 独立解码链路）' });
             if (!silenceChecked) {
@@ -1273,6 +1297,8 @@ self.onmessage = (e) => {
               }
             } else if (d.type === 'log') {
               reportAudioState(d.message || '');
+            } else if (d.type === 'level') {
+              noteAudioLevel(d.peak || 0); // worker 电平上报 → 待机/停滞判别
             } else if (d.type === 'silence') {
               reportAudioState(d.silent
                 ? '静音判定：手机采集到的是无声数据（3 秒峰值=' + Number(d.peak).toFixed(5) + '）。手机端问题：媒体音量为 0 或该 App 禁止录音'
@@ -1351,6 +1377,9 @@ self.onmessage = (e) => {
                 { cmd: 'write', data: interleaved, frames: numFrames },
                 [interleaved.buffer] // 转移所有权，零拷贝
               );
+              let fp = 0;
+              for (let i = 0; i < interleaved.length; i++) { const a = Math.abs(interleaved[i]); if (a > fp) fp = a; }
+              noteAudioLevel(fp);
               audioDecodeCount++;
               if (audioDecodeCount === 1) {
                 reportAudioState('首帧解码成功，写入环形缓冲（AudioContext=' + audioCtx.state + '，增益=' + (audioMuted ? '静音' : '开') + '）');
@@ -1384,6 +1413,9 @@ self.onmessage = (e) => {
             else if (audioPlaybackTime - now > 0.30) { audioDecodeCount++; return; }
             src.start(audioPlaybackTime);
             audioPlaybackTime += dur;
+            let fp = 0;
+            for (let i = 0; i < interleaved.length; i++) { const a = Math.abs(interleaved[i]); if (a > fp) fp = a; }
+            noteAudioLevel(fp);
             audioDecodeCount++;
             if (audioDecodeCount === 1) {
               reportAudioState('首帧解码成功（回退排程模式，AudioContext=' + audioCtx.state + '）');
@@ -1658,19 +1690,32 @@ self.onmessage = (e) => {
           stallEscalation = Math.max(stallEscalation, 1);
           forceDecoderRebuild(now);
         }
-        // ② 音频正常但 3.5s 完全没有视频数据：手机端编码器停摆（scrcpy 进程还活着）→
-        //    通知服务端重启采集会话（新会话秒发关键帧，约 3s 恢复；客户端 45s 只报一次）
+        // ② 视频无数据 3.5s：先区分「手机暂停/画面静止」与「真实停滞」——
+        //    scrcpy 对静止画面不产生视频帧（暂停、静态页面都如此），这是正常现象不能当停滞重启；
+        //    判据：手机仍在出声（解码电平 5s 内有信号）→ 真实停滞，自动重启会话；
+        //    手机无声 → 大概率暂停/静止，仅提示待机，恢复播放后画面自动接上
         else if (ws && ws.readyState === WebSocket.OPEN && lastAudioDataTime &&
             now - lastAudioDataTime < 3000 && lastVideoDataTime &&
-            now - lastVideoDataTime > 3500 && now - lastStallNotify > 45000) {
-          stallEscalation++;
-          lastStallNotify = now;
-          log('⚠ 视频流停滞（音频正常），已请求服务端重启采集…');
-          try { ws.send(JSON.stringify({ type: 'video-stall' })); } catch {}
+            now - lastVideoDataTime > 3500) {
+          const phoneActive = audioLivePeakAt && now - audioLivePeakAt < 5000 && audioLivePeak > 0.02;
+          if (phoneActive) {
+            if (now - lastStallNotify > 45000) {
+              stallEscalation++;
+              lastStallNotify = now;
+              log('⚠ 视频流停滞（手机仍在出声），已请求服务端重启采集…');
+              try { ws.send(JSON.stringify({ type: 'video-stall' })); } catch {}
+            }
+          } else {
+            if (now - lastIdleHintAt > 10000) {
+              lastIdleHintAt = now;
+              log('ℹ 手机画面静止且无声：可能已暂停或画面无变化（投屏待机中，恢复播放画面自动接上；若手机仍在播放请点「重新开始」）');
+            }
+            $('info-fps').textContent = '⏸ 待机（手机画面静止/暂停）';
+          }
         }
-        // ③ ①已重建过但 6.5s 仍不出帧（关键帧迟迟不到/重建无效）→ 升级为重启采集会话
-        else if (ws && ws.readyState === WebSocket.OPEN && lastRebuildAt &&
-            lastAudioDataTime && now - lastAudioDataTime < 3000 &&
+        // ③ ①已重建过但 6.5s 仍不出帧（关键帧迟迟不到/重建无效）→ 升级为重启采集会话（仅手机在播时）
+        else if (lastRebuildAt && lastAudioDataTime && now - lastAudioDataTime < 3000 &&
+            audioLivePeakAt && now - audioLivePeakAt < 5000 && audioLivePeak > 0.02 &&
             now - lastPaintTime > 6500 && now - lastStallNotify > 45000) {
           stallEscalation++;
           lastStallNotify = now;
@@ -1679,6 +1724,7 @@ self.onmessage = (e) => {
         }
         // ④ 重建+重启会话仍无效（解码/渲染环境级故障）→ 自刷新页面兑底（5 分钟最多一次，刷新后自动续播）
         else if (lastPaintTime && lastAudioDataTime && now - lastAudioDataTime < 3000 &&
+            audioLivePeakAt && now - audioLivePeakAt < 5000 && audioLivePeak > 0.02 &&
             now - lastPaintTime > 12000 && stallEscalation >= 2 &&
             Date.now() - lastReloadAt > 300000) {
           log('⚠ 多级自愈均无效，自动刷新页面重置解码环境（刷新后自动重新投屏）…');
