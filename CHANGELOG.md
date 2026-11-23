@@ -3,6 +3,17 @@
 本文件遵循 [语义化版本](https://semver.org/lang/zh-CN/) 规范。
 
 
+
+## [v0.6.2] - 2026-11-23
+
+### 修复：竖屏⇄横屏旋转后画面永久冻结（声音正常）
+
+- **根因**：旋转时 scrcpy 推送新分辨率的新 SPS/PPS+IDR。WebCodecs 对带内分辨率切换的兼容性不可靠，一旦解码器报错进入 `closed` 态，`feedDecoder` 对后续所有帧静默 return——画面冻结，音频链路独立不受影响，于是「卡住但有声」
+- **方案**（`public/receive.html`）：
+  - **SPS 变化检测**：新 SPS 与旧 SPS 字节不一致时标记 `rotationPending`，在下一个关键帧处 `decoder.reset()`（清旧参考帧/队列），用新 SPS/PPS+IDR 干净起播——旋转时关键帧立即送到，恢复是瞬时的
+  - **解码错误自动恢复** `recoverDecoder()`：软错误 `reset()` 清错误态；致命错误（closed 态）整体重建解码器并重新 configure；两者都等下个关键帧干净起播（防错误风暴只调度一次）
+  - `feedDecoder` 对 `unconfigured` 态自动重新 configure；`resetDecoder` 清空旋转/恢复/积压全部状态
+- 语法检查与 21 项单测全过
 ## [v0.6.1] - 2026-11-23
 
 ### 优化：倍速播放（1.25x/1.5x）时视频卡顿

@@ -660,6 +660,8 @@
     let streamBuf = new Uint8Array(0);
     let sps = null;
     let pps = null;
+    let rotationPending = false;  // 检测到 SPS 变化（旋转/分辨率切换），待下个关键帧重置解码器
+    let decoderRecoveryTimer = null; // 解码错误后的恢复任务（防错误风暴重复重建）
 
     /** 扫描 buffer 中的完整 NAL（无后续起始码的尾部视为未完成，留到下一包） */
     function scanCompleteNals(buf) {
@@ -696,7 +698,15 @@
 
       for (const nal of nals) {
         const data = merged.slice(nal.start, nal.end);
-        if (nal.type === 7) { sps = data; continue; }
+        if (nal.type === 7) {
+          if (sps && !bytesEqual(sps, data)) {
+            // 竖屏⇄横屏旋转：分辨率变化带来新 SPS。解码器对带内分辨率切换的兼容性不可靠，
+            // 标记后在下个关键帧处重置（新 SPS/PPS+IDR 干净起播），避免画面永久冻结
+            rotationPending = true;
+            log('[解码] 检测到分辨率变化（旋转屏幕），将在下个关键帧重置解码器');
+          }
+          sps = data; continue;
+        }
         if (nal.type === 8) { pps = data; continue; }
         if (nal.type !== 1 && nal.type !== 5) continue; // 跳过 SEI/AUD 等
         if (nal.type === 5) {
@@ -706,6 +716,13 @@
           if (pps) parts.push(pps);
           parts.push(data);
           keyChunkNeeded = false;
+          if (rotationPending && decoder && decoder.state !== 'closed') {
+            // 旋转重置：清掉旧参考帧/队列，用新分辨率的 SPS/PPS+IDR 重新起播
+            try { decoder.reset(); } catch {}
+            videoBacklogDrop = false;
+            rotationPending = false;
+            log('[解码] 旋转完成，已按新分辨率重置解码器');
+          }
           feedDecoder(concat(parts), true);
         } else if (!keyChunkNeeded) {
           feedDecoder(data, false);
@@ -755,7 +772,11 @@
     }
 
     function feedDecoder(data, isKey) {
-      if (!decoder || decoder.state === 'closed' || decoder.state === 'unconfigured') return;
+      if (!decoder || decoder.state === 'closed') return;
+      if (decoder.state === 'unconfigured') {
+        // 错误恢复路径可能落到未配置态：重新配置后才能继续
+        try { decoder.configure({ codec: 'avc1.42E01F' }); } catch (e) { return; }
+      }
       // 积压检测（阈值 8 帧 ≈ 130ms@60fps）：超限即进入丢帧模式
       if (!videoBacklogDrop && decoder.decodeQueueSize > 8) {
         videoBacklogDrop = true;
@@ -776,6 +797,36 @@
       } catch (e) {
         log('[解码] 丢帧：' + e.message);
       }
+    }
+
+    function bytesEqual(a, b) {
+      if (a === b) return true;
+      if (!a || !b || a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+      return true;
+    }
+
+    /* 解码错误自动恢复：软错误用 reset 清掉错误态，致命错误（closed 态）整体重建。
+     * 两者都丢掉旧参考帧等下一个关键帧干净起播——旋转/分辨率切换时关键帧是立即送到的，
+     * 恢复几乎是瞬时；普通场景下 scrcpy 编码器默认约 10s 一个 I 帧，最多等这么久。
+     * 音频链路独立于视频解码器，恢复期间声音不受影响。 */
+    function recoverDecoder() {
+      if (decoderRecoveryTimer) return; // 错误风暴时只调度一次
+      decoderRecoveryTimer = setTimeout(() => {
+        decoderRecoveryTimer = null;
+        if (!decoder) return;
+        try { if (decoder.state !== 'closed') decoder.reset(); } catch {}
+        if (decoder.state === 'closed') {
+          try { decoder.close(); } catch {}
+          decoder = null;
+          configured = false;
+          ensureDecoder();
+          configureIfNeeded();
+        }
+        keyChunkNeeded = true;
+        videoBacklogDrop = false;
+        log('[解码] 解码器已复位，等待下一个关键帧恢复画面（音频不受影响）');
+      }, 300);
     }
 
     /* ---------- 清晰度自检 ----------
@@ -818,6 +869,7 @@
         },
         error(e) {
           log('[解码] 错误：' + e.message);
+          recoverDecoder();
         },
       });
       log('[解码] 使用 WebCodecs 硬件/软件解码');
@@ -833,7 +885,9 @@
       streamBuf = new Uint8Array(0);
       sps = null;
       pps = null;
+      rotationPending = false;
       videoBacklogDrop = false;
+      if (decoderRecoveryTimer) { clearTimeout(decoderRecoveryTimer); decoderRecoveryTimer = null; }
       if (presentFrame) { try { presentFrame.close(); } catch {} }
       presentFrame = null;
     }
