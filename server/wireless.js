@@ -780,23 +780,31 @@ function setupWireless(httpServer) {
           session.stop('已手动停止').catch(reply);
           break;
         case 'video-stall':
-          // 前端看门狗②：音频正常但视频流长期无数据（手机端编码器停摆）→ 自动重启采集会话（30s 只重启一次）
+          // 前端看门狗②③：视频流停滞且手机仍在出声 → 自动重启采集会话（30s 只重启一次）。
+          // 降载阶梯（10 分钟窗口）：停滞 ≥2 次 → 降码率；≥3 次 → 切换 Android 自带软件编码器
+          // （绕开 vivo 等厂商硬件编码器被系统冻结/出错的机型问题）+ 降至 30fps；
+          // 手动停止后重新开始投屏会重置阶梯（客户端发来的新参数覆盖 lastStartOptions）
           if (session.state === 'streaming' && session.lastStartOptions) {
             const stallNow = Date.now();
             if (!session.lastVideoStallAt || stallNow - session.lastVideoStallAt > 30000) {
               session.lastVideoStallAt = stallNow;
-              // v0.6.5 自适应降载：5 分钟内反复停滞说明手机编码器负载过高（高码率+高帧率）→
-              // 每次降 25% 码率（下限 6Mbps），减少停摆复发；手动重新开始投屏则恢复所选画质档
-              session.stallTimes = (session.stallTimes || []).filter((t) => stallNow - t < 300000);
+              session.stallTimes = (session.stallTimes || []).filter((t) => stallNow - t < 600000);
               session.stallTimes.push(stallNow);
               const restartOpts = { ...session.lastStartOptions };
-              if (session.stallTimes.length >= 2 && restartOpts.bitrate && restartOpts.bitrate > 6000000) {
+              const n = session.stallTimes.length;
+              if (n >= 3 && !restartOpts.videoEncoder) {
+                restartOpts.videoEncoder = 'c2.android.avc.encoder';
+                restartOpts.bitrate = Math.min(restartOpts.bitrate || 6000000, 6000000);
+                restartOpts.maxFps = 30;
+                session.log('⚠ 10 分钟内停滞 ' + n + ' 次：疑似手机硬件编码器问题，已切换软件编码器（更稳，帧率降至 30fps）。若软件编码器仍频繁停滞，建议手机插线投屏（USB 连接最稳）或检查手机省电策略');
+                logger.info('[video-stall] 停滞 ' + n + ' 次，切换软件编码器 c2.android.avc.encoder / 30fps');
+              } else if (n >= 2 && restartOpts.bitrate && restartOpts.bitrate > 6000000) {
                 restartOpts.bitrate = Math.max(6000000, Math.floor(restartOpts.bitrate * 0.75));
-                session.lastStartOptions = restartOpts;
-                logger.info('[video-stall] 5 分钟内第 ' + session.stallTimes.length + ' 次停滞，自适应降码率至 ' + (restartOpts.bitrate / 1e6).toFixed(1) + 'Mbps');
                 session.log('⚠ 视频流频繁停滞，已自动降低码率至 ' + (restartOpts.bitrate / 1e6).toFixed(1) + ' Mbps（停止后重选画质档可恢复）');
+                logger.info('[video-stall] 10 分钟内第 ' + n + ' 次停滞，自适应降码率至 ' + (restartOpts.bitrate / 1e6).toFixed(1) + 'Mbps');
               }
-              logger.info('[video-stall] 浏览器端检测到视频流停滞（音频正常），自动重启采集会话');
+              session.lastStartOptions = restartOpts;
+              logger.info('[video-stall] 浏览器端检测到视频流停滞（手机仍在出声），自动重启采集会话');
               session.stop('视频流停滞，自动重启')
                 .then(() => session.start(restartOpts))
                 .catch((e) => logger.error('[video-stall] 自动重启失败：' + e.message));
