@@ -9,7 +9,10 @@ const fs = require('fs');
 const path = require('path');
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
-const FILE = path.join(DATA_DIR, 'last-connection.json');
+// 允许测试通过环境变量把存储指到临时文件：测试绝不能写真实缓存
+// （v0.6.7 之前测试直写 data/last-connection.json，把用户缓存的最新地址覆盖回测试样例 38051，
+//  导致自动回填一直连旧端口——样例地址恰好与用户旧端口重合，极具迷惑性）
+const FILE = process.env.LC_CONNECTION_FILE || path.join(DATA_DIR, 'last-connection.json');
 
 function load() {
   try {

@@ -958,7 +958,7 @@
       configuredCodec = null;
       if (decoderRecoveryTimer) { clearTimeout(decoderRecoveryTimer); decoderRecoveryTimer = null; }
       if (paintTimer) { clearTimeout(paintTimer); paintTimer = null; }
-      rafPending = false;
+      paintScheduled = false;
       lastPaintTime = performance.now();
       lastVideoDataTime = 0;
       lastRebuildAt = 0;

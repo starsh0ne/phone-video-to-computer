@@ -707,6 +707,14 @@ class WirelessSession {
 
 /* ---------------- WebSocket 端点 ---------------- */
 
+// 崩溃兑底：把未捕获异常/未处理的 Promise 拒绝落盘（此前服务进程曾静默退出，日志里零痕迹无法排查）
+process.on('uncaughtException', (err) => {
+  try { logger.error('[崩溃] 未捕获异常：' + (err && (err.stack || err.message) || err)); } catch {}
+});
+process.on('unhandledRejection', (reason) => {
+  try { logger.error('[崩溃] 未处理的 Promise 拒绝：' + (reason && (reason.stack || reason.message || reason))); } catch {}
+});
+
 function setupWireless(httpServer) {
   const session = new WirelessSession();
   // 进程退出时恢复手机亮屏策略（execSync 保证在 exit 事件里同步完成，否则会留下「屏幕常亮」的残留设置）

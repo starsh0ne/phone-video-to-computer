@@ -4,6 +4,10 @@
  */
 'use strict';
 
+// 连接缓存测试必须指向临时文件：绝不能写真实的 data/last-connection.json
+// （此前测试直写真实文件且样例地址恰为用户旧端口 38051，每轮 npm test 都把用户缓存改回旧端口）
+process.env.LC_CONNECTION_FILE = require('path').join(__dirname, '.last-connection-test.json');
+
 const assert = require('assert');
 const { KeyframeCache, generateQrPairingSecrets, ScrcpyStreamReader, CODEC_H264, CODEC_OPUS, STREAM_DISABLE } = require('../server/wireless');
 const connStore = require('../server/connection-store');
@@ -230,18 +234,18 @@ test('ScrcpyStreamReader 头部未收齐（<4 字节）不误触发', () => {
 /* ---------------- 连接地址持久化 ---------------- */
 
 test('connection-store 保存并读回合法地址', () => {
-  connStore.save('192.168.137.141:38051');
+  connStore.save('192.168.99.99:9999'); // 测试样例地址，且写入的是临时文件（见文件头 LC_CONNECTION_FILE）
   const l = connStore.load();
   assert.ok(l);
-  assert.strictEqual(l.addr, '192.168.137.141:38051');
+  assert.strictEqual(l.addr, '192.168.99.99:9999');
   assert.ok(l.savedAt > 0);
 });
 
 test('connection-store 对非法/损坏数据返回 null', () => {
   const fs = require('fs');
-  fs.writeFileSync(require('path').join(__dirname, '..', 'data', 'last-connection.json'), 'not-json{', 'utf8');
+  fs.writeFileSync(connStore.FILE, 'not-json{', 'utf8');
   assert.strictEqual(connStore.load(), null);
-  connStore.save('192.168.137.141:38051'); // 恢复
+  connStore.save('192.168.99.99:9999'); // 恢复（临时测试文件，不影响真实缓存）
 });
 /* ---------------- 异步顺序执行 ---------------- */
 
