@@ -470,6 +470,13 @@ class WirelessSession {
         remotePath: SCRCPY_REMOTE_PATH,
       });
       logger.info('[scrcpy 启动命令] ' + this.serverProc.cmd);
+      // v0.6.5：投屏期间保持手机亮屏（svc power stayon）——熄屏后画面采集停摆、音频退化为静音包，
+      // 正是日志里反复出现的停摆形态（熄屏超时 ~2 分钟与停摆间隔吻合）；stop() / 进程退出时恢复
+      try {
+        await adbapi.shell(adbPath, serial, 'svc power stayon true');
+        this.keepAwakeOn = true;
+        this.log('已保持手机亮屏（投屏期间，停止后自动恢复）');
+      } catch {}
       // 服务端日志转发给页面（排查问题用，stdout/stderr 全量逐行）
       const pipeLog = (d) => {
         for (const line of d.toString().split(/\r?\n/)) {
@@ -674,6 +681,14 @@ class WirelessSession {
       this.serverProc.stop();
       this.serverProc = null;
     }
+    if (this.keepAwakeOn) {
+      // 恢复手机屏幕超时策略（正常停止路径；Ctrl+C 走 process exit 的同步兑底）
+      this.keepAwakeOn = false;
+      try {
+        await adbapi.shell(this.adbPath, this.serial, 'svc power stayon false');
+        this.log('已恢复手机屏幕超时策略');
+      } catch {}
+    }
     if (this.adbPath && this.serial && this.forwardPort) {
       await adbapi.removeForward(this.adbPath, this.serial, this.forwardPort).catch(() => {});
     }
@@ -687,6 +702,14 @@ class WirelessSession {
 
 function setupWireless(httpServer) {
   const session = new WirelessSession();
+  // 进程退出时恢复手机亮屏策略（execSync 保证在 exit 事件里同步完成，否则会留下「屏幕常亮」的残留设置）
+  process.on('exit', () => {
+    if (session.keepAwakeOn && session.adbPath && session.serial) {
+      try {
+        require('child_process').execSync(`"${session.adbPath}" -s ${session.serial} shell svc power stayon false`, { stdio: 'ignore', timeout: 3000 });
+      } catch {}
+    }
+  });
   // noServer 模式 + 自行路由：避免与 /ws 的 WebSocketServer 相互拒绝对方的 upgrade 请求
   const wss = new WebSocketServer({ noServer: true });
   wss.on('connection', (ws) => {
@@ -747,7 +770,17 @@ function setupWireless(httpServer) {
             const stallNow = Date.now();
             if (!session.lastVideoStallAt || stallNow - session.lastVideoStallAt > 30000) {
               session.lastVideoStallAt = stallNow;
-              const restartOpts = session.lastStartOptions;
+              // v0.6.5 自适应降载：5 分钟内反复停滞说明手机编码器负载过高（高码率+高帧率）→
+              // 每次降 25% 码率（下限 6Mbps），减少停摆复发；手动重新开始投屏则恢复所选画质档
+              session.stallTimes = (session.stallTimes || []).filter((t) => stallNow - t < 300000);
+              session.stallTimes.push(stallNow);
+              const restartOpts = { ...session.lastStartOptions };
+              if (session.stallTimes.length >= 2 && restartOpts.bitrate && restartOpts.bitrate > 6000000) {
+                restartOpts.bitrate = Math.max(6000000, Math.floor(restartOpts.bitrate * 0.75));
+                session.lastStartOptions = restartOpts;
+                logger.info('[video-stall] 5 分钟内第 ' + session.stallTimes.length + ' 次停滞，自适应降码率至 ' + (restartOpts.bitrate / 1e6).toFixed(1) + 'Mbps');
+                session.log('⚠ 视频流频繁停滞，已自动降低码率至 ' + (restartOpts.bitrate / 1e6).toFixed(1) + ' Mbps（停止后重选画质档可恢复）');
+              }
               logger.info('[video-stall] 浏览器端检测到视频流停滞（音频正常），自动重启采集会话');
               session.stop('视频流停滞，自动重启')
                 .then(() => session.start(restartOpts))

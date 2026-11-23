@@ -175,6 +175,15 @@ async function push(adbPath, serial, localPath, remotePath) {
  *    改用分粒度选项：保留 stream meta（4 字节编码器 id）与 frame meta（12 字节 PTS+长度头），
  *    由服务端解析帧头后分发视频/音频。
  */
+/** 执行一条 shell 命令（成功/失败都 resolve，返回是否成功；用于 svc power stayon 等环境开关） */
+function shell(adbPath, serial, command) {
+  return new Promise((resolve) => {
+    const child = spawn(adbPath, ['-s', serial, 'shell', command], { windowsHide: true });
+    child.on('error', () => resolve(false));
+    child.on('close', (code) => resolve(code === 0));
+  });
+}
+
 function startScrcpyServer(adbPath, serial, serverVersion, options = {}) {
   const bitrate = options.bitrate || 16000000;
   // maxSize：0 = 不限制（手机原始分辨率）；未传 = 1920；>0 = 最长边上限
@@ -245,6 +254,7 @@ module.exports = {
   adbStream,
   pair,
   connect,
+  shell,
   parseMdnsServices,
   mdnsServicesDetailed,
   mdnsServices,
