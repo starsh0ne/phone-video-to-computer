@@ -330,7 +330,7 @@
         <label>画质（全屏观看建议选高清或原生）</label>
         <select id="wl-quality" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:inherit">
           <option value="high" selected>高清 · 1080p / 16Mbps（推荐）</option>
-          <option value="balanced">流畅 · 900p / 8Mbps</option>
+          <option value="balanced">流畅 · 900p / 10Mbps / 60fps</option>
           <option value="native">原生 · 手机原始分辨率 / 20Mbps</option>
         </select>
       </div>
@@ -722,8 +722,51 @@
       return out;
     }
 
+    // ---- 视频流畅性（v0.6.1）----
+    // 1) 解码积压控制：decodeQueueSize 超阈值即丢弃后续 delta 帧直到下一个关键帧（reset 后重同步），
+    //    延迟不累积——倍速播放/网络抖动时靠丢帧保节奏，而不是越播越卡
+    // 2) rAF 垂直同步呈现：解码出的帧先暂存，由 requestAnimationFrame 每个显示刷新周期画最新一帧，
+    //    帧到达抖动不再直接映射为画面抖动；倍速下帧间隔被压缩 1.5 倍，这一步是流畅的关键
+    let presentFrame = null;      // 待呈现的最新帧（旧的直接关闭，零等待）
+    let rafPending = false;       // rAF 是否已排队
+    let videoBacklogDrop = false; // 正在因积压丢帧（直到下个关键帧）
+    let videoBacklogEvents = 0;   // 累计发生积压丢帧的次数（诊断用）
+
+    function paintFrame() {
+      rafPending = false;
+      const frame = presentFrame;
+      presentFrame = null;
+      if (!frame) return;
+      try {
+        const c2d = canvasEl.getContext('2d');
+        if (canvasEl.width !== frame.displayWidth || canvasEl.height !== frame.displayHeight) {
+          canvasEl.width = frame.displayWidth;
+          canvasEl.height = frame.displayHeight;
+        }
+        c2d.drawImage(frame, 0, 0);
+      } catch (e) {
+        log('[解码] 绘制异常：' + e.message);
+      } finally {
+        try { frame.close(); } catch {}
+      }
+      frameCount++;
+      showCanvas();
+      hintUpscale(canvasEl);
+    }
+
     function feedDecoder(data, isKey) {
       if (!decoder || decoder.state === 'closed' || decoder.state === 'unconfigured') return;
+      // 积压检测（阈值 8 帧 ≈ 130ms@60fps）：超限即进入丢帧模式
+      if (!videoBacklogDrop && decoder.decodeQueueSize > 8) {
+        videoBacklogDrop = true;
+        videoBacklogEvents++;
+        log('[解码] 解码积压（队列 ' + decoder.decodeQueueSize + ' 帧），丢帧至下个关键帧重同步');
+      }
+      if (videoBacklogDrop) {
+        if (!isKey) return; // 积压期间只等关键帧
+        try { decoder.reset(); } catch {} // reset 回到已配置态，配合 in-band SPS/PPS 重新起播
+        videoBacklogDrop = false;
+      }
       try {
         decoder.decode(new EncodedVideoChunk({
           type: isKey ? 'key' : 'delta',
@@ -765,16 +808,13 @@
       }
       decoder = new VideoDecoder({
         output(frame) {
-          const c2d = canvasEl.getContext('2d');
-          if (canvasEl.width !== frame.displayWidth || canvasEl.height !== frame.displayHeight) {
-            canvasEl.width = frame.displayWidth;
-            canvasEl.height = frame.displayHeight;
+          // rAF 呈现：暂存最新帧（被更新的帧立即关闭，不留积压），vsync 时统一上屏
+          if (presentFrame) { try { presentFrame.close(); } catch {} }
+          presentFrame = frame;
+          if (!rafPending) {
+            rafPending = true;
+            requestAnimationFrame(paintFrame);
           }
-          c2d.drawImage(frame, 0, 0);
-          frame.close();
-          frameCount++;
-          showCanvas();
-          hintUpscale(canvasEl);
         },
         error(e) {
           log('[解码] 错误：' + e.message);
@@ -793,6 +833,9 @@
       streamBuf = new Uint8Array(0);
       sps = null;
       pps = null;
+      videoBacklogDrop = false;
+      if (presentFrame) { try { presentFrame.close(); } catch {} }
+      presentFrame = null;
     }
 
     /* ---------- 音频（scrcpy Opus 48kHz 双声道 → WebCodecs → WebAudio） ----------
@@ -1510,7 +1553,7 @@ self.onmessage = (e) => {
       const q = $('wl-quality') ? $('wl-quality').value : 'high';
       const presets = {
         high: { maxSize: 1920, bitrate: 16000000, maxFps: 60 },
-        balanced: { maxSize: 1600, bitrate: 8000000, maxFps: 45 },
+        balanced: { maxSize: 1600, bitrate: 10000000, maxFps: 60 },
         native: { maxSize: 0, bitrate: 20000000, maxFps: 60 },
       };
       const preset = presets[q] || presets.high;
