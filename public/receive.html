@@ -740,13 +740,24 @@
       return out;
     }
 
+    /** 从 Annex-B SPS 提取真实 profile/constraint/level → avc1.PPCCLL（供解码器按实际规格配置） */
+    function codecFromSps(sps) {
+      const h = (b) => b.toString(16).padStart(2, '0');
+      for (let i = 0; i + 6 < sps.length; i++) {
+        if (sps[i] === 0 && sps[i + 1] === 0 && sps[i + 2] === 1 && (sps[i + 3] & 0x1f) === 7) {
+          return 'avc1.' + h(sps[i + 4]) + h(sps[i + 5]) + h(sps[i + 6]);
+        }
+      }
+      return null;
+    }
+
     // ---- 视频流畅性（v0.6.1）----
     // 1) 解码积压控制：decodeQueueSize 超阈值即丢弃后续 delta 帧直到下一个关键帧（reset 后重同步），
     //    延迟不累积——倍速播放/网络抖动时靠丢帧保节奏，而不是越播越卡
     // 2) rAF 垂直同步呈现：解码出的帧先暂存，由 requestAnimationFrame 每个显示刷新周期画最新一帧，
     //    帧到达抖动不再直接映射为画面抖动；倍速下帧间隔被压缩 1.5 倍，这一步是流畅的关键
     let presentFrame = null;      // 待呈现的最新帧（旧的直接关闭，零等待）
-    let rafPending = false;       // rAF 是否已排队
+    let paintScheduled = false;   // 是否已排队一次上屏（rAF 或定时器）
     let videoBacklogDrop = false; // 正在因积压丢帧（直到下个关键帧）
     let videoBacklogEvents = 0;   // 累计发生积压丢帧的次数（诊断用）
     let paintTimer = null;        // 页面不可见时 rAF 停摆的定时器兑底
@@ -754,10 +765,23 @@
     let lastVideoDataTime = 0;    // 最近一次收到视频数据时刻（看门狗②）
     let lastAudioDataTime = 0;    // 最近一次收到音频数据时刻（看门狗②：音频活=采集进程活）
     let lastRebuildAt = 0;        // 最近一次强制重建解码器时刻（8s 门限防连环重建）
-    let lastStallNotify = 0;      // 最近一次向服务端上报视频流停滞时刻（60s 门限）
+    let lastStallNotify = 0;      // 最近一次向服务端上报视频流停滞时刻（45s 门限）
+    let stallEscalation = 0;      // 停摆自愈升级级别：1=已重建解码器 2=已重启会话（≥2 且仍停摆 → 刷新页面）
+    let lastReloadAt = 0;         // 最近一次自刷新页面时刻（Date.now 基准，5 分钟限频防刷新循环）
+    try { lastReloadAt = Number(sessionStorage.getItem('wl-auto-reload-at') || 0); } catch {}
+
+    function schedulePaint() {
+      if (paintScheduled) return;
+      paintScheduled = true;
+      // 页面被遮挡/切后台时 rAF 可能完全停摆（音频走 Worker 不受影响）——定时器兑底继续上屏最新帧；
+      // 可见时用 rAF 与显示刷新周期对齐（v0.6.6：单一排队标记，杜绝 rAF 挂起后标记永真的渲染死锁）
+      if (document.hidden) paintTimer = setTimeout(paintFrame, 250);
+      else requestAnimationFrame(paintFrame);
+    }
 
     function paintFrame() {
-      rafPending = false;
+      paintScheduled = false;
+      stallEscalation = 0; // 成功上屏 = 恢复健康，自愈升级级别归零
       if (paintTimer) { clearTimeout(paintTimer); paintTimer = null; }
       const frame = presentFrame;
       presentFrame = null;
@@ -795,7 +819,19 @@
       }
       // reset/重建后解码器可能回到未配置态：配置后再送帧（否则 decode 抛 InvalidStateError）
       if (decoder.state === 'unconfigured') {
-        try { decoder.configure({ codec: 'avc1.42E01F' }); } catch (e) { return; }
+        try { decoder.configure({ codec: 'avc1.42E01F' }); configuredCodec = 'avc1.42E01F'; } catch (e) { return; }
+      }
+      // v0.6.6：按 SPS 的真实 profile/level 配置——42E01F（Baseline L3.1）低于 1080p60 所需规格，
+      // 部分硬件解码器对超规格码流会静默卡死（只积压不出帧、无错误回调），用真实规格配置是根治
+      if (isKey && sps) {
+        const realCodec = codecFromSps(sps);
+        if (realCodec && configuredCodec !== realCodec) {
+          try {
+            decoder.configure({ codec: realCodec });
+            configuredCodec = realCodec;
+            log('[解码] 已按码流实际规格配置解码器（' + realCodec + '）');
+          } catch (e) { /* 用原配置继续 */ }
+        }
       }
       try {
         decoder.decode(new EncodedVideoChunk({
@@ -829,6 +865,7 @@
           try { decoder.close(); } catch {}
           decoder = null;
           configured = false;
+          configuredCodec = null;
           ensureDecoder();
           configureIfNeeded();
         }
@@ -848,6 +885,7 @@
       try { if (decoder) decoder.close(); } catch {}
       decoder = null;
       configured = false;
+      configuredCodec = null;
       keyChunkNeeded = true;
       videoBacklogDrop = false;
       rotationPending = false;
@@ -880,12 +918,7 @@
     window.addEventListener('resize', () => { upscaleHinted = false; if (canvasEl) hintUpscale(canvasEl); });
     // 页面重新可见：立刻排队一次上屏（后台期间 rAF 停摆，只靠节流定时器保底最新帧）
     document.addEventListener('visibilitychange', () => {
-      if (document.hidden) {
-        if (presentFrame && !paintTimer) paintTimer = setTimeout(paintFrame, 250);
-      } else if (presentFrame && !rafPending) {
-        rafPending = true;
-        requestAnimationFrame(paintFrame);
-      }
+      if (!document.hidden && presentFrame) schedulePaint();
     });
 
     /* ---------- WebCodecs 解码器 ---------- */
@@ -900,13 +933,7 @@
           // rAF 呈现：暂存最新帧（被更新的帧立即关闭，不留积压），vsync 时统一上屏
           if (presentFrame) { try { presentFrame.close(); } catch {} }
           presentFrame = frame;
-          if (!rafPending) {
-            rafPending = true;
-            // 页面被遮挡/切后台时 rAF 完全停摆（音频走 Worker 不受影响），
-            // 用定时器兑底继续上屏最新帧，否则画面会冻结（v0.6.3）
-            if (document.hidden) paintTimer = setTimeout(paintFrame, 250);
-            else requestAnimationFrame(paintFrame);
-          }
+          schedulePaint();
         },
         error(e) {
           log('[解码] 错误：' + e.message);
@@ -928,6 +955,7 @@
       pps = null;
       rotationPending = false;
       videoBacklogDrop = false;
+      configuredCodec = null;
       if (decoderRecoveryTimer) { clearTimeout(decoderRecoveryTimer); decoderRecoveryTimer = null; }
       if (paintTimer) { clearTimeout(paintTimer); paintTimer = null; }
       rafPending = false;
@@ -1535,6 +1563,16 @@ self.onmessage = (e) => {
           setStatus(msg.message);
           const wasStreaming = wsState === 'streaming';
           updateButtons(msg.state);
+          if (msg.state === 'ready') {
+            // 页面自刷新兑底后自动续播（仅自刷新流程触发，普通使用不受影响）
+            try {
+              if (sessionStorage.getItem('wl-auto-start') === '1') {
+                sessionStorage.removeItem('wl-auto-start');
+                log('自动恢复：重新开始投屏…');
+                setTimeout(() => { try { $('wl-btn-start').click(); } catch {} }, 800);
+              }
+            } catch {}
+          }
           if (msg.state === 'streaming') {
             if (wasStreaming) resetDecoder(); else { configured = false; keyChunkNeeded = true; }
             ensureDecoder();
@@ -1584,11 +1622,14 @@ self.onmessage = (e) => {
     }
 
     let configured = false;
+    let configuredCodec = null; // 解码器当前配置的 codec 串（首帧后用 SPS 真实规格覆盖默认值）
     function configureIfNeeded() {
       if (configured || !decoder) return;
       if (decoder.state === 'unconfigured') {
-        // 码流为 Annex-B（无 description），SPS/PPS 在带内随关键帧送入，Chrome/Edge 可自动解析
+        // 码流为 Annex-B（无 description），SPS/PPS 在带内随关键帧送入，Chrome/Edge 可自动解析；
+        // 首个关键帧到达后再按 SPS 真实规格重新配置（见 feedDecoder）
         decoder.configure({ codec: 'avc1.42E01F' });
+        configuredCodec = 'avc1.42E01F';
         configured = true;
         startFps();
       }
@@ -1604,11 +1645,17 @@ self.onmessage = (e) => {
         $('info-fps').textContent = fps + ' fps (无线)';
         $('stat-text').textContent = canvasEl.width + '×' + canvasEl.height;
         frameCount = 0; fpsTime = now;
-        // ---- 卡屏看门狗（v0.6.4 提速：停摆到恢复 ≤5s）----
+        // ---- 卡屏看门狗 ----
+        // ⓪ 渲染兑底：有待上屏帧但 1.2s 没画（rAF 挂起、排队标记永真）→ 定时器强制上屏打破死锁
+        if (presentFrame && lastPaintTime && now - lastPaintTime > 1200) {
+          if (paintTimer) clearTimeout(paintTimer);
+          paintTimer = setTimeout(paintFrame, 100);
+        }
         // ① 有视频数据但 2.5s 不出帧：浏览器解码器停摆（硬件解码偶发卡死且无错误回调）→ 强制重建
         if (decoder && configured && !keyChunkNeeded && lastVideoDataTime &&
             now - lastVideoDataTime < 1500 && now - lastPaintTime > 2500 &&
             now - lastRebuildAt > 8000) {
+          stallEscalation = Math.max(stallEscalation, 1);
           forceDecoderRebuild(now);
         }
         // ② 音频正常但 3.5s 完全没有视频数据：手机端编码器停摆（scrcpy 进程还活着）→
@@ -1616,6 +1663,7 @@ self.onmessage = (e) => {
         else if (ws && ws.readyState === WebSocket.OPEN && lastAudioDataTime &&
             now - lastAudioDataTime < 3000 && lastVideoDataTime &&
             now - lastVideoDataTime > 3500 && now - lastStallNotify > 45000) {
+          stallEscalation++;
           lastStallNotify = now;
           log('⚠ 视频流停滞（音频正常），已请求服务端重启采集…');
           try { ws.send(JSON.stringify({ type: 'video-stall' })); } catch {}
@@ -1624,9 +1672,21 @@ self.onmessage = (e) => {
         else if (ws && ws.readyState === WebSocket.OPEN && lastRebuildAt &&
             lastAudioDataTime && now - lastAudioDataTime < 3000 &&
             now - lastPaintTime > 6500 && now - lastStallNotify > 45000) {
+          stallEscalation++;
           lastStallNotify = now;
           log('⚠ 解码器重建后画面仍未恢复，升级为重启采集会话…');
           try { ws.send(JSON.stringify({ type: 'video-stall' })); } catch {}
+        }
+        // ④ 重建+重启会话仍无效（解码/渲染环境级故障）→ 自刷新页面兑底（5 分钟最多一次，刷新后自动续播）
+        else if (lastPaintTime && lastAudioDataTime && now - lastAudioDataTime < 3000 &&
+            now - lastPaintTime > 12000 && stallEscalation >= 2 &&
+            Date.now() - lastReloadAt > 300000) {
+          log('⚠ 多级自愈均无效，自动刷新页面重置解码环境（刷新后自动重新投屏）…');
+          try {
+            sessionStorage.setItem('wl-auto-reload-at', String(Date.now()));
+            sessionStorage.setItem('wl-auto-start', '1');
+          } catch {}
+          location.reload();
         }
       }, 1000);
     }
@@ -1673,10 +1733,16 @@ self.onmessage = (e) => {
       sendSafe({ type: 'connect', addr });
       setStatus('正在连接…');
     };
+    // 恢复上次使用的画质档位（页面自刷新兑底后自动续播也用它）
+    try {
+      const savedQ = localStorage.getItem('wl-quality');
+      if (savedQ) { const qel = document.getElementById('wl-quality'); if (qel) qel.value = savedQ; }
+    } catch {}
     $('wl-btn-start').onclick = () => {
       resetDecoder();
       // 画质档位 → scrcpy 参数：max_size 0 = 手机原始分辨率；码率越高越清晰（占带宽越多）
       const q = $('wl-quality') ? $('wl-quality').value : 'high';
+      try { localStorage.setItem('wl-quality', q); } catch {} // 持久化：页面自刷新兑底后自动续播用
       const presets = {
         high: { maxSize: 1920, bitrate: 16000000, maxFps: 60 },
         balanced: { maxSize: 1600, bitrate: 10000000, maxFps: 60 },

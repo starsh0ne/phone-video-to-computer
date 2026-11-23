@@ -418,15 +418,18 @@ class WirelessSession {
             } catch { /* 尝试下一个 */ }
           }
         }
-        // 2. adb devices 里已就绪的无线设备（ip:port 或 mDNS 服务名）
+        // 2. adb devices 里已就绪的无线设备（ip:port 或 mDNS 服务名）——先探活再采信：
+        //    断开的旧传输可能在列表里残留「device」状态，直接采信会把失效端口写入缓存（v0.6.6）
         const list = await adbapi.devices(adbPath);
-        const wireless = list.find((s) => adbapi.isWirelessSerial(s));
-        if (wireless) {
-          this.serial = wireless;
-          if (/^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(wireless)) {
-            connStore.save(wireless); // v0.6.4：这条路径也要覆盖保存——否则旧端口永远残留，回填一直是失效地址
+        const wirelessList = list.filter((s) => adbapi.isWirelessSerial(s));
+        for (const s of wirelessList) {
+          const alive = await adbapi.shell(adbPath, s, 'echo ok').catch(() => false);
+          if (!alive) continue;
+          this.serial = s;
+          if (/^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(s)) {
+            connStore.save(s); // 覆盖保存，纠正任何旧端口残留
           }
-          this.setState('ready', '已连接：' + this.serial + '，可以开始投屏');
+          this.setState('ready', '已连接：' + s + '，可以开始投屏');
           return true;
         }
       } catch (err) {
@@ -477,6 +480,10 @@ class WirelessSession {
         this.keepAwakeOn = true;
         this.log('已保持手机亮屏（投屏期间，停止后自动恢复）');
       } catch {}
+      // 实际开流的地址覆盖缓存：无论哪个路径之前写入了旧值，都用真正在流的地址纠偏（v0.6.6）
+      if (/^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(this.serial)) {
+        connStore.save(this.serial);
+      }
       // 服务端日志转发给页面（排查问题用，stdout/stderr 全量逐行）
       const pipeLog = (d) => {
         for (const line of d.toString().split(/\r?\n/)) {
