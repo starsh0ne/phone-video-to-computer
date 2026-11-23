@@ -428,6 +428,7 @@ class WirelessSession {
 
   /* ---------- 开始投屏 ---------- */
   async start(options = {}) {
+    this.lastStartOptions = { ...options }; // video-stall 看门狗自动重启时复用
     if (this.state === 'streaming') throw new Error('已在投屏中');
     try {
       this.setState('connecting', '正在准备投屏…');
@@ -729,6 +730,20 @@ function setupWireless(httpServer) {
           break;
         case 'stop':
           session.stop('已手动停止').catch(reply);
+          break;
+        case 'video-stall':
+          // 前端看门狗②：音频正常但视频流长期无数据（手机端编码器停摆）→ 自动重启采集会话（30s 只重启一次）
+          if (session.state === 'streaming' && session.lastStartOptions) {
+            const stallNow = Date.now();
+            if (!session.lastVideoStallAt || stallNow - session.lastVideoStallAt > 30000) {
+              session.lastVideoStallAt = stallNow;
+              const restartOpts = session.lastStartOptions;
+              logger.info('[video-stall] 浏览器端检测到视频流停滞（音频正常），自动重启采集会话');
+              session.stop('视频流停滞，自动重启')
+                .then(() => session.start(restartOpts))
+                .catch((e) => logger.error('[video-stall] 自动重启失败：' + e.message));
+            }
+          }
           break;
         case 'client-log':
           // 前端音频诊断回报：落盘到文件日志，便于事后定位「无声」到底断在哪一环

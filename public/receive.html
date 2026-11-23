@@ -689,6 +689,7 @@
     }
 
     function onVideoData(chunk) {
+      lastVideoDataTime = performance.now(); // 看门狗：区分「没数据」与「有数据不出帧」
       const incoming = new Uint8Array(chunk);
       const merged = new Uint8Array(streamBuf.length + incoming.length);
       merged.set(streamBuf, 0);
@@ -748,9 +749,16 @@
     let rafPending = false;       // rAF 是否已排队
     let videoBacklogDrop = false; // 正在因积压丢帧（直到下个关键帧）
     let videoBacklogEvents = 0;   // 累计发生积压丢帧的次数（诊断用）
+    let paintTimer = null;        // 页面不可见时 rAF 停摆的定时器兑底
+    let lastPaintTime = 0;        // 最近一次上屏时刻（看门狗①）
+    let lastVideoDataTime = 0;    // 最近一次收到视频数据时刻（看门狗②）
+    let lastAudioDataTime = 0;    // 最近一次收到音频数据时刻（看门狗②：音频活=采集进程活）
+    let lastRebuildAt = 0;        // 最近一次强制重建解码器时刻（8s 门限防连环重建）
+    let lastStallNotify = 0;      // 最近一次向服务端上报视频流停滞时刻（60s 门限）
 
     function paintFrame() {
       rafPending = false;
+      if (paintTimer) { clearTimeout(paintTimer); paintTimer = null; }
       const frame = presentFrame;
       presentFrame = null;
       if (!frame) return;
@@ -766,6 +774,7 @@
       } finally {
         try { frame.close(); } catch {}
       }
+      lastPaintTime = performance.now();
       frameCount++;
       showCanvas();
       hintUpscale(canvasEl);
@@ -773,10 +782,6 @@
 
     function feedDecoder(data, isKey) {
       if (!decoder || decoder.state === 'closed') return;
-      if (decoder.state === 'unconfigured') {
-        // 错误恢复路径可能落到未配置态：重新配置后才能继续
-        try { decoder.configure({ codec: 'avc1.42E01F' }); } catch (e) { return; }
-      }
       // 积压检测（阈值 8 帧 ≈ 130ms@60fps）：超限即进入丢帧模式
       if (!videoBacklogDrop && decoder.decodeQueueSize > 8) {
         videoBacklogDrop = true;
@@ -785,8 +790,12 @@
       }
       if (videoBacklogDrop) {
         if (!isKey) return; // 积压期间只等关键帧
-        try { decoder.reset(); } catch {} // reset 回到已配置态，配合 in-band SPS/PPS 重新起播
+        try { decoder.reset(); } catch {} // 清空队列与旧参考帧，配合 in-band SPS/PPS 重新起播
         videoBacklogDrop = false;
+      }
+      // reset/重建后解码器可能回到未配置态：配置后再送帧（否则 decode 抛 InvalidStateError）
+      if (decoder.state === 'unconfigured') {
+        try { decoder.configure({ codec: 'avc1.42E01F' }); } catch (e) { return; }
       }
       try {
         decoder.decode(new EncodedVideoChunk({
@@ -825,8 +834,28 @@
         }
         keyChunkNeeded = true;
         videoBacklogDrop = false;
+        lastRebuildAt = performance.now();
         log('[解码] 解码器已复位，等待下一个关键帧恢复画面（音频不受影响）');
       }, 300);
+    }
+
+    /* 看门狗①强制重建：视频数据仍在到达但持续不出帧（硬件解码器停摆、无错误回调的黑盒场景）。
+     * 整体 close 后重建解码器并等下一个关键帧；任何解码侧停摆都在数秒内自愈。 */
+    function forceDecoderRebuild(now) {
+      lastRebuildAt = now || performance.now();
+      log('[解码] 画面停摆但数据仍在到达，强制重建解码器（音频不受影响）');
+      if (decoderRecoveryTimer) { clearTimeout(decoderRecoveryTimer); decoderRecoveryTimer = null; }
+      try { if (decoder) decoder.close(); } catch {}
+      decoder = null;
+      configured = false;
+      keyChunkNeeded = true;
+      videoBacklogDrop = false;
+      rotationPending = false;
+      if (presentFrame) { try { presentFrame.close(); } catch {} }
+      presentFrame = null;
+      ensureDecoder();
+      configureIfNeeded();
+      lastPaintTime = performance.now(); // 给下一个关键帧留宽限（连环重建由 lastRebuildAt 8s 门限兑底）
     }
 
     /* ---------- 清晰度自检 ----------
@@ -849,6 +878,15 @@
       }
     }
     window.addEventListener('resize', () => { upscaleHinted = false; if (canvasEl) hintUpscale(canvasEl); });
+    // 页面重新可见：立刻排队一次上屏（后台期间 rAF 停摆，只靠节流定时器保底最新帧）
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        if (presentFrame && !paintTimer) paintTimer = setTimeout(paintFrame, 250);
+      } else if (presentFrame && !rafPending) {
+        rafPending = true;
+        requestAnimationFrame(paintFrame);
+      }
+    });
 
     /* ---------- WebCodecs 解码器 ---------- */
     function ensureDecoder() {
@@ -864,7 +902,10 @@
           presentFrame = frame;
           if (!rafPending) {
             rafPending = true;
-            requestAnimationFrame(paintFrame);
+            // 页面被遮挡/切后台时 rAF 完全停摆（音频走 Worker 不受影响），
+            // 用定时器兑底继续上屏最新帧，否则画面会冻结（v0.6.3）
+            if (document.hidden) paintTimer = setTimeout(paintFrame, 250);
+            else requestAnimationFrame(paintFrame);
           }
         },
         error(e) {
@@ -888,6 +929,12 @@
       rotationPending = false;
       videoBacklogDrop = false;
       if (decoderRecoveryTimer) { clearTimeout(decoderRecoveryTimer); decoderRecoveryTimer = null; }
+      if (paintTimer) { clearTimeout(paintTimer); paintTimer = null; }
+      rafPending = false;
+      lastPaintTime = performance.now();
+      lastVideoDataTime = 0;
+      lastRebuildAt = 0;
+      lastStallNotify = 0;
       if (presentFrame) { try { presentFrame.close(); } catch {} }
       presentFrame = null;
     }
@@ -1415,6 +1462,7 @@ self.onmessage = (e) => {
     }
 
     function onAudioData(isConfig, payload) {
+      lastAudioDataTime = performance.now(); // 看门狗②：音频活=采集进程活，音频正常而视频停摆→采集侧问题
       // 优先路径：解码 Worker 已就绪 → 原始包直接转发（拷贝一份，worker 与主线程互不干扰）
       if (audioWorkerReady && workletBound && audioWorker) {
         const copy = payload.slice();
@@ -1556,6 +1604,22 @@ self.onmessage = (e) => {
         $('info-fps').textContent = fps + ' fps (无线)';
         $('stat-text').textContent = canvasEl.width + '×' + canvasEl.height;
         frameCount = 0; fpsTime = now;
+        // ---- 卡屏看门狗（v0.6.3）----
+        // ① 有视频数据但 2.5s 不出帧：浏览器解码器停摆（硬件解码偶发卡死且无错误回调）→ 强制重建
+        if (decoder && configured && !keyChunkNeeded && lastVideoDataTime &&
+            now - lastVideoDataTime < 1500 && now - lastPaintTime > 2500 &&
+            now - lastRebuildAt > 8000) {
+          forceDecoderRebuild(now);
+        }
+        // ② 音频正常但 8s 完全没有视频数据：手机端视频编码器停摆（scrcpy 进程还活着）→
+        //    通知服务端自动重启采集会话（客户端 60s 只报一次）
+        else if (ws && ws.readyState === WebSocket.OPEN && lastAudioDataTime &&
+            now - lastAudioDataTime < 3000 && lastVideoDataTime &&
+            now - lastVideoDataTime > 8000 && now - lastStallNotify > 60000) {
+          lastStallNotify = now;
+          log('⚠ 视频流停滞（音频正常），已请求服务端重启采集…');
+          try { ws.send(JSON.stringify({ type: 'video-stall' })); } catch {}
+        }
       }, 1000);
     }
     function stopFps() {
