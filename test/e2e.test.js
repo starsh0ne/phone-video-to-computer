@@ -1,24 +1,28 @@
-/**
+﻿/**
  * local-cast 端到端自动化测试（无浏览器依赖）
  *
  * 覆盖：
- *  1. HTTP 静态页面可访问（电脑端接收页 / 手机端投屏页）
- *  2. /api/session 生成 6 位投屏码与二维码 DataURL
- *  3. WebSocket 信令：电脑端加入 → 手机端加入 → 双向 peer-ready
- *  4. WebRTC 信令消息（offer/answer/candidate）双向转发
- *  5. 无效投屏码拒绝
- *  6. 手机端断开后电脑端收到 peer-left
- *  7. 重新生成投屏码后旧码失效
+ *  1. HTTP 静态页面可访问（电脑端接收页，localhost 访问）
+ *  2. HTTPS 静态页面可访问（手机端投屏页）
+ *  3. /api/session 生成 6 位投屏码与 HTTPS 二维码
+ *  4. WebSocket 信令：电脑端加入 → 手机端加入 → 双向 peer-ready
+ *  5. WebRTC 信令消息（offer/answer/candidate）双向转发
+ *  6. 无效投屏码拒绝
+ *  7. 手机端断开后电脑端收到 peer-left
+ *  8. 重新生成投屏码后旧码失效
  */
 'use strict';
 
 const http = require('http');
+const https = require('https');
 const path = require('path');
 const { spawn } = require('child_process');
 const WebSocket = require('ws');
 
-const TEST_PORT = 18099;
-const BASE = `http://127.0.0.1:${TEST_PORT}`;
+const TEST_PORT_HTTP = 18099;
+const TEST_PORT_HTTPS = 18100;
+const HTTP_BASE = `http://127.0.0.1:${TEST_PORT_HTTP}`;
+const HTTPS_BASE = `https://127.0.0.1:${TEST_PORT_HTTPS}`;
 
 let passed = 0, failed = 0;
 const failures = [];
@@ -36,9 +40,21 @@ function httpGet(url) {
   });
 }
 
+function httpsGet(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { rejectUnauthorized: false }, (res) => {
+      let body = '';
+      res.on('data', (c) => (body += c));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body }));
+    }).on('error', reject);
+  });
+}
+
 function wsCollect(url, handlers, timeoutMs = 3000) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(url);
+    // wss（自签名证书）连接需放行证书校验
+    const options = url.startsWith('wss://') ? { rejectUnauthorized: false } : undefined;
+    const ws = new WebSocket(url, options);
     const received = [];
     const timer = setTimeout(() => reject(new Error('WebSocket 连接超时')), timeoutMs);
     ws.on('open', () => {
@@ -58,9 +74,13 @@ function wsCollect(url, handlers, timeoutMs = 3000) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
-  console.log('启动测试服务（端口 ' + TEST_PORT + '）...');
+  console.log('启动测试服务（HTTP ' + TEST_PORT_HTTP + ' / HTTPS ' + TEST_PORT_HTTPS + '）...');
   const server = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'server.js')], {
-    env: { ...process.env, PORT: String(TEST_PORT) },
+    env: {
+      ...process.env,
+      PORT_HTTP: String(TEST_PORT_HTTP),
+      PORT_HTTPS: String(TEST_PORT_HTTPS),
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stdout.on('data', () => {});
@@ -68,29 +88,31 @@ async function main() {
 
   try {
     // 等待服务就绪
-    await sleep(800);
-    await httpGet(BASE + '/health').catch(() => null);
+    await sleep(1000);
+    await httpGet(HTTP_BASE + '/health').catch(() => null);
 
-    console.log('\n[1] HTTP 静态页面');
-    let r = await httpGet(BASE + '/');
+    console.log('\n[1] HTTP 静态页面（电脑端）');
+    let r = await httpGet(HTTP_BASE + '/');
     r.status === 200 && r.body.includes('投屏接收端') ? ok('电脑端接收页可访问') : bad('电脑端接收页可访问', `status=${r.status}`);
 
-    r = await httpGet(BASE + '/cast');
-    r.status === 200 && r.body.includes('手机投屏') ? ok('手机端投屏页可访问') : bad('手机端投屏页可访问', `status=${r.status}`);
+    console.log('\n[2] HTTPS 静态页面（手机端，安全上下文）');
+    r = await httpsGet(HTTPS_BASE + '/cast');
+    r.status === 200 && r.body.includes('手机投屏') ? ok('手机端投屏页（HTTPS）可访问') : bad('手机端投屏页（HTTPS）可访问', `status=${r.status}`);
 
-    console.log('\n[2] 投屏码与二维码接口');
-    r = await httpGet(BASE + '/api/session');
+    console.log('\n[3] 投屏码与二维码接口');
+    r = await httpGet(HTTP_BASE + '/api/session');
     const session = JSON.parse(r.body);
     session.code && /^\d{6}$/.test(session.code) ? ok('生成 6 位投屏码：' + session.code) : bad('生成 6 位投屏码', JSON.stringify(session));
     session.qr && session.qr.startsWith('data:image/png;base64,') ? ok('二维码为本地 PNG DataURL（无外部请求）') : bad('二维码为本地 PNG DataURL', session.qr ? '格式不符' : '缺失');
-    session.castUrl && session.castUrl.includes('/cast?code=' + session.code) ? ok('投屏链接包含投屏码') : bad('投屏链接包含投屏码', session.castUrl);
+    session.castUrl && session.castUrl.startsWith('https://') && session.castUrl.includes('/cast?code=' + session.code) ? ok('投屏链接为 HTTPS 且包含投屏码') : bad('投屏链接为 HTTPS 且包含投屏码', session.castUrl);
 
     const code = session.code;
-    const wsUrl = `ws://127.0.0.1:${TEST_PORT}/ws`;
+    const wsUrl = `ws://127.0.0.1:${TEST_PORT_HTTP}/ws`;
+    const wssUrl = `wss://127.0.0.1:${TEST_PORT_HTTPS}/ws`;
 
-    console.log('\n[3] 信令会话匹配');
+    console.log('\n[4] 信令会话匹配（电脑端走 ws://，手机端走 wss://）');
     // 电脑端加入
-    const computer = await wsCollect(wsUrl, {});
+    const computer = await wsCollect(`ws://127.0.0.1:${TEST_PORT_HTTP}/ws`, {});
     computer.send(JSON.stringify({ type: 'join', role: 'computer', code }));
     await sleep(200);
     let joined = computer._collected.find((m) => m.type === 'joined');
@@ -99,7 +121,7 @@ async function main() {
     waiting ? ok('电脑端进入等待手机状态') : bad('电脑端进入等待手机状态', JSON.stringify(computer._collected));
 
     // 无效投屏码
-    const badPhone = await wsCollect(wsUrl, {});
+    const badPhone = await wsCollect(wssUrl, {});
     const badPhoneClosed = new Promise((res) => badPhone.on('close', res));
     badPhone.send(JSON.stringify({ type: 'join', role: 'phone', code: '000000' }));
     await sleep(200);
@@ -110,7 +132,7 @@ async function main() {
     badPhone.terminate && badPhone.terminate();
 
     // 手机端加入
-    const phone = await wsCollect(wsUrl, {});
+    const phone = await wsCollect(wssUrl, {});
     phone.send(JSON.stringify({ type: 'join', role: 'phone', code }));
     await sleep(200);
     let phoneReady = phone._collected.find((m) => m.type === 'peer-ready');
@@ -118,7 +140,7 @@ async function main() {
     let computerReady = computer._collected.find((m) => m.type === 'peer-ready');
     computerReady ? ok('电脑端收到手机端就绪通知') : bad('电脑端收到手机端就绪通知', JSON.stringify(computer._collected));
 
-    console.log('\n[4] WebRTC 信令转发');
+    console.log('\n[5] WebRTC 信令转发');
     const fakeOffer = { type: 'offer', sdp: 'fake-offer-sdp' };
     const offerReceived = new Promise((resolve) => {
       computer.on('message', (raw) => {
@@ -150,7 +172,7 @@ async function main() {
     const gotCand = await Promise.race([candReceived, sleep(3000).then(() => null)]);
     gotCand ? ok('ICE candidate 双向转发正常') : bad('ICE candidate 双向转发正常', '未收到');
 
-    console.log('\n[5] 断开与失效');
+    console.log('\n[6] 断开与失效');
     const leftReceived = new Promise((resolve) => {
       computer.on('message', (raw) => {
         const m = JSON.parse(raw.toString());
@@ -164,7 +186,7 @@ async function main() {
     // 电脑端断开后，用旧码重连应失败（会话失效）
     computer.close();
     await sleep(200);
-    const stale = await wsCollect(wsUrl, {});
+    const stale = await wsCollect(wssUrl, {});
     stale.send(JSON.stringify({ type: 'join', role: 'phone', code }));
     await sleep(200);
     const staleErr = stale._collected.find((m) => m.type === 'error');

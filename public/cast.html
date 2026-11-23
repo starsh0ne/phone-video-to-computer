@@ -127,6 +127,9 @@
     padding: 10px 12px;
     font-size: 13px;
     line-height: 1.6;
+    white-space: pre-line;
+    max-height: 320px;
+    overflow-y: auto;
   }
   .error-box.show { display: block; }
 
@@ -217,10 +220,10 @@
 
   <div class="card">
     <ul class="tips">
-      <li>支持 Chrome、Edge、百度浏览器、vivo 浏览器等 Chromium 内核浏览器，可直接投屏</li>
-      <li>微信内置浏览器（X5 内核）不支持屏幕采集，请点右上角「···」→「在浏览器中打开」，选择上述浏览器</li>
-      <li>点击「开始投屏」后，系统会弹出屏幕采集授权，请选择「整个屏幕」并确认</li>
+      <li>⚠️ Android 浏览器（Chrome / Edge / 百度 / vivo / 微信等）均不支持网页屏幕采集，这是系统平台限制，请改用电脑端接收页的「无线投屏」</li>
+      <li>📱 iOS 27+ 的 Safari 支持本页直接投屏：点「开始投屏」→ 在系统弹窗中选择「整个屏幕」并确认</li>
       <li>授权后即可把手机画面（含红果、抖音、B站等任意 App）实时投到电脑</li>
+      <li>电脑端「无线投屏」无需手机装 App：手机开启「无线调试」→ 配对 → 即可投任意应用画面</li>
     </ul>
   </div>
 
@@ -268,32 +271,48 @@
     return { kernel: 'unknown', isIos, label: '当前浏览器' };
   }
 
-  /** 检测当前浏览器是否支持屏幕采集，返回结果与针对性引导文案 */
+  /** 检测当前浏览器是否支持屏幕采集，返回结果与针对性引导文案（含诊断详情） */
   function checkSupport() {
     const hasDisplayMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
     const browser = detectBrowser();
-    if (hasDisplayMedia) return { ok: true, browser };
-    if (browser.kernel === 'x5') {
+    // 关键诊断：isSecureContext 反映页面是否被浏览器视为安全上下文
+    const secureContext = window.isSecureContext;
+    const ua = navigator.userAgent || '';
+    const isAndroid = /android/i.test(ua);
+    const diag = [
+      '【诊断详情】',
+      '访问地址：' + location.href,
+      '安全上下文：' + (secureContext ? '是' : '否（isSecureContext = false）'),
+      '屏幕采集接口：' + (hasDisplayMedia ? '存在' : '不存在'),
+      '浏览器：' + browser.label + '（' + browser.kernel + ' 内核）',
+    ].join('\n');
+
+    if (hasDisplayMedia && secureContext) return { ok: true, browser, diag };
+
+    // Android 平台限制：所有浏览器（Chrome/Edge/百度/vivo/UC/微信等）均未实现 getDisplayMedia。
+    // 这是 Chromium/Firefox 移动版的平台级缺失，与证书、浏览器版本无关，换浏览器或升级均无法解决。
+    if (isAndroid) {
       return {
-        ok: false, browser,
-        guide: '微信/QQ 内置浏览器（X5 内核）不支持屏幕采集。请点右上角「···」→「在浏览器中打开」，选择 Chrome / Edge / 百度浏览器等打开本页，即可正常投屏。',
+        ok: false, browser, diag,
+        guide: '很抱歉，Android 的所有浏览器（包括 Chrome、Edge、百度、vivo、UC、微信等）都未实现网页屏幕采集接口（getDisplayMedia），这是 Android 平台级限制，与「连接不安全」提示、证书或浏览器版本无关，换浏览器、升级浏览器都无法解决。\n\n✅ 请改用「无线投屏」方式（推荐）：回到电脑端接收页，点击「无线投屏」，按页面提示在手机上开启「无线调试」并输入配对码即可投屏，手机无需安装任何 App，支持红果、抖音、B站等任意应用画面。\n\n' + diag,
       };
     }
     if (browser.isIos) {
       return {
-        ok: false, browser,
-        guide: 'iOS 系统的 Safari 与微信暂不支持屏幕采集接口，无法投屏。建议改用 Android 手机，使用 Chrome / Edge / 百度浏览器 / vivo 浏览器打开本页。',
+        ok: false, browser, diag,
+        guide: 'iOS 系统在 Safari 27 之前的版本不支持网页屏幕采集接口。请将 iOS 与 Safari 升级到最新版本后再试；若仍不可用，可改用 Android 手机并使用电脑端的「无线投屏」方式。\n\n' + diag,
       };
     }
-    if (browser.kernel === 'chromium') {
+    if (hasDisplayMedia && !secureContext) {
+      // 桌面浏览器经 http 非安全上下文访问（少见）：提示改用 localhost 或 HTTPS
       return {
-        ok: false, browser,
-        guide: '当前浏览器为 Chromium 内核（已识别：' + browser.label + '），理论上支持投屏，但当前版本未启用屏幕采集接口。请升级浏览器至最新版后重试，或点击下方链接复制，粘贴到 Chrome / Edge 中打开。',
+        ok: false, browser, diag,
+        guide: '当前页面不在安全上下文中（isSecureContext = false），浏览器因此隐藏了屏幕采集接口。请改用 https:// 地址或 http://localhost 打开本页。\n\n' + diag,
       };
     }
     return {
-      ok: false, browser,
-      guide: '当前浏览器不支持屏幕采集（getDisplayMedia）。推荐使用 Chrome、Edge、百度浏览器或 vivo 浏览器（均为 Chromium 内核）打开本页。可点击下方链接复制后粘贴到浏览器中打开。',
+      ok: false, browser, diag,
+      guide: '当前浏览器不支持屏幕采集（getDisplayMedia）。推荐使用 iOS 27+ 的 Safari，或 Android 手机通过电脑端的「无线投屏」方式投屏。\n\n' + diag,
     };
   }
 
@@ -406,9 +425,9 @@
       return;
     }
 
-    // 部分国产 Chromium 浏览器 API 存在但采集不到画面，做兜底校验
+    // 兜底校验：极少数浏览器 API 存在但采集不到画面
     if (!localStream.getVideoTracks().length) {
-      showError('屏幕采集未返回画面（当前浏览器：' + detectBrowser().label + '）。请升级浏览器至最新版，或换用 Chrome / Edge 打开本页重试。');
+      showError('屏幕采集未返回画面（当前浏览器：' + detectBrowser().label + '）。若多次失败，Android 手机请改用电脑端的「无线投屏」方式。');
       setStatus('采集无画面', 'bad');
       $('btn-cast').disabled = false;
       return;
