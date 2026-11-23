@@ -216,7 +216,9 @@ class WirelessSession {
 
   broadcastBinary(buf) {
     for (const ws of this.clients) {
-      if (ws.readyState === ws.OPEN) ws.send(buf);
+      // 慢客户端保护：积压 > 2MB 的客户端（隐藏/卡死的旧标签页）跳过视频帧，
+      // 防止其拖慢广播与内存；音频/控制消息体量小，仍正常发送
+      if (ws.readyState === ws.OPEN && ws.bufferedAmount < 2 * 1024 * 1024) ws.send(buf);
     }
   }
 
@@ -442,6 +444,7 @@ class WirelessSession {
   /* ---------- 开始投屏 ---------- */
   async start(options = {}) {
     this.lastStartOptions = { ...options }; // video-stall 看门狗自动重启时复用
+    this.stallTimes = []; // 手动开流重置降载阶梯（新一轮投屏从阶梯底部开始）
     if (this.state === 'streaming') throw new Error('已在投屏中');
     try {
       this.setState('connecting', '正在准备投屏…');
@@ -729,6 +732,11 @@ function setupWireless(httpServer) {
   const wss = new WebSocketServer({ noServer: true });
   wss.on('connection', (ws) => {
     session.clients.add(ws);
+    if (session.state === 'streaming' && session.clients.size > 1) {
+      // 多端同时接收是允许的，但要提醒：每个页面都在独立解码+跑看门狗，
+      // 隐藏的旧标签页会成倍增加卡顿并触发多余的重启
+      session.log('⚠ 检测到 ' + session.clients.size + ' 个页面同时接收投屏（可能是旧标签页）。多端同时解码会成倍增加卡顿，建议关闭多余的标签页只保留一个');
+    }
     // 新客户端：先发当前状态；投屏中则补发关键帧缓存，保证立即出画面
     session.send(ws, { type: 'status', state: session.state, message: session.message });
     if (session.qrPair) {
@@ -792,6 +800,15 @@ function setupWireless(httpServer) {
               session.stallTimes.push(stallNow);
               const restartOpts = { ...session.lastStartOptions };
               const n = session.stallTimes.length;
+              if (n > 5) {
+                // 重启风暴熔断：反复重建 MediaProjection 会话会刺激 vivo 等系统进一步限流，越重启越糟
+                if (stallNow - (session.lastCapLogAt || 0) > 60000) {
+                  session.lastCapLogAt = stallNow;
+                  session.log('⚠ 10 分钟内已自动重启 5 次仍未稳定：手机端采集正被系统反复中断，已暂停自动重启（避免投影会话反复重建加重限流）。请点「停止投屏」再重新开始（重置计数）；持续如此建议手机插线使用或检查省电策略');
+                  logger.info('[video-stall] 10 分钟内自动重启达 5 次，暂停自动重启');
+                }
+                break;
+              }
               if (n >= 3 && !restartOpts.videoEncoder) {
                 restartOpts.videoEncoder = 'c2.android.avc.encoder';
                 restartOpts.bitrate = Math.min(restartOpts.bitrate || 6000000, 6000000);

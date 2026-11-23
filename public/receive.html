@@ -766,6 +766,9 @@
     let lastAudioDataTime = 0;    // 最近一次收到音频数据时刻（看门狗②：音频活=采集进程活）
     let lastRebuildAt = 0;        // 最近一次强制重建解码器时刻（8s 门限防连环重建）
     let lastStallNotify = 0;      // 最近一次向服务端上报视频流停滞时刻（45s 门限）
+    let stallNotifyTimes = [];    // 10 分钟窗口内的上报时刻（≥5 次熔断：手机端采集正被系统反复中断时，
+                                  // 反复重建投影会话会刺激系统进一步限流，越重启越糟）
+    let lastCapHintAt = 0;        // 最近一次「已熔断」提示时刻
     let stallEscalation = 0;      // 停摆自愈升级级别：1=已重建解码器 2=已重启会话（≥2 且仍停摆 → 刷新页面）
     let lastReloadAt = 0;         // 最近一次自刷新页面时刻（Date.now 基准，5 分钟限频防刷新循环）
     try { lastReloadAt = Number(sessionStorage.getItem('wl-auto-reload-at') || 0); } catch {}
@@ -1700,10 +1703,19 @@ self.onmessage = (e) => {
           const phoneActive = audioLivePeakAt && now - audioLivePeakAt < 5000 && audioLivePeak > 0.02;
           if (phoneActive) {
             if (now - lastStallNotify > 45000) {
-              stallEscalation++;
-              lastStallNotify = now;
-              log('⚠ 视频流停滞（手机仍在出声），已请求服务端重启采集…');
-              try { ws.send(JSON.stringify({ type: 'video-stall' })); } catch {}
+              stallNotifyTimes = stallNotifyTimes.filter((t) => now - t < 600000);
+              if (stallNotifyTimes.length >= 5) {
+                if (now - lastCapHintAt > 60000) {
+                  lastCapHintAt = now;
+                  log('⚠ 10 分钟内已自动重启 5 次仍未稳定：手机端采集正被系统反复中断，已暂停自动重启。请点「停止投屏」再重新开始（重置计数）；持续如此建议手机插线或检查省电策略');
+                }
+              } else {
+                stallNotifyTimes.push(now);
+                stallEscalation++;
+                lastStallNotify = now;
+                log('⚠ 视频流停滞（手机仍在出声），已请求服务端重启采集…');
+                try { ws.send(JSON.stringify({ type: 'video-stall' })); } catch {}
+              }
             }
           } else {
             if (now - lastIdleHintAt > 10000) {
