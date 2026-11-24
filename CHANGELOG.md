@@ -456,3 +456,7 @@
 - 投屏码为单会话模型，一对多投屏留待 v2
 - iOS（Safari/微信）系统层面不支持屏幕采集，暂不适用，需使用 Android 手机
 - 屏幕采集依赖浏览器 `getDisplayMedia` 支持，推荐 Chromium 内核浏览器；手机端需经 HTTPS 访问（首次需确认自签名证书）
+
+### 补充修复：stop() 防重入
+- USB 热切换触发时，旧 socket 的 close 事件会在 stop 进行中**嵌套再次 stop**，破坏新会话的转发端口与状态（实测导致 USB 会话「启动失败」）→ `stopping` 标志防重入，close/error 处理器同步加防护
+- 真机验证全通过：熄屏指令生效（Device display turned off）→ Wi-Fi 中途插线自动切 USB → USB 会话熄屏指令再次生效 → streaming 稳定
