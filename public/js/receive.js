@@ -431,12 +431,11 @@
     let lastReloadAt = 0;         // 最近一次自刷新页面时刻（Date.now 基准，5 分钟限频防刷新循环）
     try { lastReloadAt = Number(sessionStorage.getItem('wl-auto-reload-at') || 0); } catch {}
 
-    // 音画同步目标延迟：对齐音频环形缓冲水位；上限 300ms（链路突发式投递时水位常在 300-600 波动，
-    // 追随更高目标会放大呈现队列容量压力）；下限 60ms 保流畅。水位未上报前用 120ms 默认值
-    function targetDelayMs() {
-      const t = audioBufferMs > 0 ? audioBufferMs : 120;
-      return Math.min(300, Math.max(60, t));
-    }
+    // 音画同步目标延迟：固定 150ms，与音频环形缓冲的目标水位对齐。
+    // 注意：绝不把目标绑到实时水位——水位会被网络突发顶高，而呈现队列容量有限，
+    // 绑定会导致「头部帧永远到不了龄就被挤掉」的呈现死锁（v0.7.2-0.7.4 教训：
+    // 到达 0/呈现 0 但码率正常、解码池被滞留帧耗尽）。音频侧由 worklet 的
+    // 深水位校正把水位收敛在 ~200ms，两侧误差可控制在 ±100ms 内
 
     function schedulePaint() {
       if (paintScheduled) return;
@@ -479,19 +478,19 @@
         return;
       }
       const now = performance.now();
-      const target = targetDelayMs();
-      // FIFO 呈现 + 音画同步（v0.7.3）：丢掉明显过时的头部帧（> target+120ms）；
-      // 首帧到龄（容差 30ms）即上屏——容差内的提前呈现避免突发到达时的「冻结→快进」节奏，
-      // 平滑优先于严格同步
-      while (frameQueue.length > 1 && now - frameQueue[0].t > target + 150) {
+      // FIFO 呈现 + 固定 150ms 同步延迟（v0.7.5）：解码帧在队列中等到龄后按序上屏，
+      // 与音频环形缓冲的目标水位对齐；过时头部帧（>300ms）直接丢弃。
+      // 不要把目标绑到实时水位：水位被网络突发顶高而队列容量有限，绑定会造呈现死锁
+      // （v0.7.2-0.7.4 教训：到达 0/呈现 0 卡死循环）
+      while (frameQueue.length > 1 && now - frameQueue[0].t > 300) {
         const stale = frameQueue.shift();
         queueDrops++;
         try { stale.frame.close(); } catch {}
       }
       const head = frameQueue[0];
-      if (now - head.t < target - 40) {
-        // 首帧还没到龄：按到龄时间排队下一次上屏
-        const wait = Math.max(5, Math.min(100, target - 30 - (now - head.t)));
+      if (now - head.t < 110) {
+        // 首帧还没到龄（110ms = 150ms 目标 - 40ms 容差）：按到龄时间排队下一次上屏
+        const wait = Math.max(5, Math.min(100, 110 - (now - head.t)));
         paintScheduled = true;
         paintTimer = setTimeout(paintFrame, wait);
         return;
@@ -520,7 +519,7 @@
       }
       // reset/重建后解码器可能回到未配置态：配置后再送帧（否则 decode 抛 InvalidStateError）
       if (decoder.state === 'unconfigured') {
-        try { decoder.configure({ codec: 'avc1.42E01F', optimizeForLatency: true }); configuredCodec = 'avc1.42E01F'; } catch (e) { return; }
+        try { decoder.configure({ codec: 'avc1.42E01F' }); configuredCodec = 'avc1.42E01F'; } catch (e) { return; }
       }
       // v0.6.6：按 SPS 的真实 profile/level 配置——42E01F（Baseline L3.1）低于 1080p60 所需规格，
       // 部分硬件解码器对超规格码流会静默卡死（只积压不出帧、无错误回调），用真实规格配置是根治
@@ -528,7 +527,7 @@
         const realCodec = codecFromSps(sps);
         if (realCodec && configuredCodec !== realCodec) {
           try {
-            decoder.configure({ codec: realCodec, optimizeForLatency: true });
+            decoder.configure({ codec: realCodec });
             configuredCodec = realCodec;
             log('[解码] 已按码流实际规格配置解码器（' + realCodec + '）');
           } catch (e) { /* 用原配置继续 */ }
@@ -1182,7 +1181,9 @@
       if (decoder.state === 'unconfigured') {
         // 码流为 Annex-B（无 description），SPS/PPS 在带内随关键帧送入，Chrome/Edge 可自动解析；
         // 首个关键帧到达后再按 SPS 真实规格重新配置（见 feedDecoder）
-        decoder.configure({ codec: 'avc1.42E01F', optimizeForLatency: true }); // 实时镜像：牺牲重排序缓冲换低延迟
+        // 实时镜像曾尝试 optimizeForLatency:true，但在「呈现队列持有多个 VideoFrame」的架构下
+        // 会缩小解码器输出池容限、与队列滞留帧叠加造成输出停摆（v0.7.2-0.7.4 死锁教训），勿加回
+        decoder.configure({ codec: 'avc1.42E01F' });
         configuredCodec = 'avc1.42E01F';
         configured = true;
         startFps();
@@ -1206,7 +1207,7 @@
           const q = decoder ? decoder.decodeQueueSize : 0;
           const link = streamInfo ? streamInfo.link : '';
           const inFps = sec > 0 ? Math.round(decodedWindow / sec) : 0;
-          const syncErr = audioBufferMs ? Math.round(audioBufferMs - targetDelayMs()) : 0;
+          const syncErr = audioBufferMs ? Math.round(audioBufferMs - 150) : 0;
           const parts = [
             '链路 ' + (link || '—') + (streamInfo && streamInfo.softwareEncoder ? '·软编' : ''),
             '到达 ' + inFps + ' / 呈现 ' + fps + ' fps',
