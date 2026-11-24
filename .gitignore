@@ -8,3 +8,5 @@ certs/
 tools/
 
 test/.last-connection-test.json
+
+data/
