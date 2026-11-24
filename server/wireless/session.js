@@ -1,187 +1,30 @@
 /**
- * 无线投屏通道：ADB（无线调试）+ scrcpy-server 采集手机屏幕 → H.264 裸流 → WebSocket → 电脑端 WebCodecs 解码
+ * 无线投屏会话状态机（单例：同一时间只允许一路无线投屏）。
  *
- * 与网页直投通道（cast.html）并存：
- *  - Android 所有浏览器均不支持 getDisplayMedia（平台限制），本通道不经浏览器、直接由 scrcpy-server 采集；
- *  - iOS 27+ Safari 仍可用网页直投通道。
- *
- * WebSocket 端点：/wireless（挂在电脑端 HTTP 服务，localhost 访问）
- *  - 客户端 → 服务端（JSON）：{type:'pair'|'qr-pair-start'|'qr-pair-cancel'|'connect'|'start'|'stop'|'status', ...}
- *  - 服务端 → 客户端（JSON）：{type:'status'|'log'|'error'|'qr-pair', ...}
- *  - 服务端 → 客户端（二进制）：H.264 Annex-B 裸流分片
- *
- * 二维码配对（AOSP adb_wifi 协议）：
- *  电脑生成 `WIFI:T:ADB;S:studio-XXXX;P:密码;;` 二维码 → 手机相机扫码后以指定服务名启动配对服务
- *  → 电脑通过 adb mdns services 发现该服务 → adb pair <ip:port> <密码> → 自动连接。
+ * 生命周期：idle → pairing/connecting → ready → streaming → idle。
+ * 职责：设备连接（显式地址 + mDNS 自动发现 + 缓存纠偏）、scrcpy-server 推送与启动、
+ *       视频/音频双 socket 建立与数据广播、停滞自愈触发、亮屏保持、投屏码配对。
+ * 消息路由由 ws-endpoint.js 完成，本模块只对外提供动作方法与广播通道。
  */
 'use strict';
 
 const net = require('net');
-const crypto = require('crypto');
-const { WebSocketServer } = require('ws');
 const QRCode = require('qrcode');
-const tools = require('./tools');
-const adbapi = require('./adb');
-const logger = require('./logger');
-const connStore = require('./connection-store');
+const tools = require('../tools');
+const adbapi = require('../adb');
+const logger = require('../logger');
+const connStore = require('../connection-store');
+const { KeyframeCache } = require('./keyframe-cache');
+const { generateQrPairingSecrets } = require('./pairing');
+const {
+  ScrcpyStreamReader,
+  CODEC_H264,
+  CODEC_OPUS,
+  STREAM_DISABLE,
+  STREAM_ERROR,
+  SCRCPY_REMOTE_PATH,
+} = require('./stream-reader');
 
-const SCRCPY_REMOTE_PATH = '/data/local/tmp/scrcpy-server';
-
-/**
- * H.264 Annex-B 关键帧缓存：
- * 保留 SPS/PPS 与最近一个 IDR 起始的全部数据，新加入的页面先收缓存再收实时流，
- * 无需等待下一个 GOP（scrcpy 默认关键帧间隔约 10s）。
- */
-class KeyframeCache {
-  constructor(limit = 32 * 1024 * 1024) {
-    this.limit = limit;
-    this.reset();
-  }
-
-  reset() {
-    this.buffer = Buffer.alloc(0);   // 最近 IDR 起的全部数据（含起始码）
-    this.sps = Buffer.alloc(0);      // 最近一次 SPS NAL（含起始码）
-    this.pps = Buffer.alloc(0);      // 最近一次 PPS NAL（含起始码）
-    this.scanFrom = 0;               // 已扫描到的位置（保留少量回溯窗口）
-    this.keyframeSeen = false;
-  }
-
-  /** 在 buf 中从 from 开始找下一个起始码（00 00 01）位置，找不到返回 -1 */
-  static findStartCode(buf, from) {
-    const end = buf.length - 2;
-    for (let i = from; i < end; i++) {
-      if (buf[i] === 0 && buf[i + 1] === 0 && buf[i + 2] === 1) return i;
-    }
-    return -1;
-  }
-
-  /** 喂入一段流数据 */
-  push(chunk) {
-    this.buffer = Buffer.concat([this.buffer, chunk]);
-    this.scan();
-
-    // 容量保护：超限时只保留最近数据（极端情况丢失引导能力，前端等下一个 IDR 即可）
-    if (this.buffer.length > this.limit) {
-      this.buffer = this.buffer.slice(-Math.floor(this.limit / 2));
-      this.scanFrom = 0;
-      this.scan();
-    }
-  }
-
-  /** 扫描未处理区域，记录 SPS/PPS 与最新 IDR 位置 */
-  scan() {
-    const buf = this.buffer;
-    // 回溯 4 字节，避免跨 chunk 的起始码被漏掉
-    let i = Math.max(0, this.scanFrom - 4);
-    let idrPos = -1;
-    while (i < buf.length - 3) {
-      if (buf[i] === 0 && buf[i + 1] === 0 && buf[i + 2] === 1) {
-        const hdr = i + 3;
-        if (hdr < buf.length) {
-          const type = buf[hdr] & 0x1f;
-          const next = KeyframeCache.findStartCode(buf, hdr);
-          const nalEnd = next === -1 ? buf.length : next;
-          if (type === 7) {
-            this.sps = buf.slice(i, nalEnd);
-          } else if (type === 8) {
-            this.pps = buf.slice(i, nalEnd);
-          } else if (type === 5) {
-            idrPos = i;
-            this.keyframeSeen = true;
-          }
-        }
-        i = hdr;
-      } else {
-        i++;
-      }
-    }
-    this.scanFrom = buf.length;
-    // 出现新的 IDR：缓存从该关键帧重新开始
-    if (idrPos > 0) {
-      this.buffer = this.buffer.slice(idrPos);
-      this.scanFrom -= idrPos;
-    } else if (idrPos === 0) {
-      this.scanFrom = buf.length;
-    }
-  }
-
-  /** 新客户端加入时发送的引导数据（SPS+PPS+最近 IDR 起的流） */
-  bootstrap() {
-    if (!this.keyframeSeen) return Buffer.alloc(0);
-    const parts = [];
-    if (this.sps.length) parts.push(this.sps);
-    if (this.pps.length) parts.push(this.pps);
-    parts.push(this.buffer);
-    return Buffer.concat(parts);
-  }
-}
-
-/** 生成二维码配对密钥材料：服务实例名 + 配对密码（纯字母数字，规避 WIFI: 串转义问题） */
-function generateQrPairingSecrets() {
-  const alnum = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  const pick = (n) => Array.from(crypto.randomBytes(n))
-    .map((b) => alnum[b % alnum.length]).join('');
-  const instance = 'studio-' + pick(10);
-  const password = pick(20);
-  return { instance, password, qrString: `WIFI:T:ADB;S:${instance};P:${password};;` };
-}
-
-/**
- * scrcpy v3+ 流解析器（send_stream_meta=true + send_frame_meta=true 的线格式）：
- *   [4 字节编码器 id（大端）]  之后为若干帧：
- *   - 会话元数据（首 8 字节最高位为 1）：12 字节 flags+width+height，跳过
- *   - 普通帧：[8 字节 PTS+标志（大端）][4 字节包长（大端）][载荷]
- *     bit62=配置包（视频 CSD / 音频 OpusHead），bit61=关键帧
- * 音频流特例：首 4 字节若为 0x00000000 表示设备禁用音频（继续仅视频），
- * 0x00000001 表示配置错误（服务端会退出）。
- */
-class ScrcpyStreamReader {
-  constructor({ onHeader, onPacket } = {}) {
-    this.onHeader = onHeader || (() => {});
-    this.onPacket = onPacket || (() => {});
-    this.headerSeen = false;
-    this.buf = null;
-  }
-
-  push(chunk) {
-    this.buf = this.buf ? Buffer.concat([this.buf, chunk]) : chunk;
-    while (this.buf && this.buf.length) {
-      if (!this.headerSeen) {
-        if (this.buf.length < 4) return;
-        const id = this.buf.readUInt32BE(0);
-        this.buf = this.buf.subarray(4);
-        this.headerSeen = true;
-        this.onHeader(id);
-        continue;
-      }
-      if (this.buf.length < 12) return;
-      const ptsFlags = this.buf.readBigUInt64BE(0);
-      const size = this.buf.readUInt32BE(8);
-      if ((ptsFlags >> 63n) & 1n) {
-        // 会话元数据（分辨率等）：整体 12 字节，跳过
-        this.buf = this.buf.subarray(12);
-        continue;
-      }
-      if (this.buf.length < 12 + size) return;
-      const payload = Buffer.from(this.buf.subarray(12, 12 + size));
-      this.buf = this.buf.length === 12 + size ? null : this.buf.subarray(12 + size);
-      this.onPacket({
-        pts: Number(ptsFlags & 0x1fffffffffffffffn),
-        config: ((ptsFlags >> 62n) & 1n) === 1n,
-        keyFrame: ((ptsFlags >> 61n) & 1n) === 1n,
-        payload,
-      });
-    }
-  }
-}
-
-/* 常量：scrcpy 编码器 id（4 字节 ASCII） */
-const CODEC_H264 = 0x68323634;      // 'h264'
-const CODEC_OPUS = 0x6f707573;      // 'opus'
-const STREAM_DISABLE = 0x00000000;  // 设备禁用该流（如 Android <11 无法采集音频）
-const STREAM_ERROR = 0x00000001;    // 配置错误
-
-/** 无线投屏会话（单例：同一时间只允许一路无线投屏） */
 class WirelessSession {
   constructor() {
     this.clients = new Set();
@@ -474,6 +317,7 @@ class WirelessSession {
         maxFps: options.maxFps,
         audio: wantAudio,
         remotePath: SCRCPY_REMOTE_PATH,
+        videoEncoder: options.videoEncoder, // v0.6.9 阶梯第③级：软件编码器（补全透传）
       });
       logger.info('[scrcpy 启动命令] ' + this.serverProc.cmd);
       // v0.6.5：投屏期间保持手机亮屏（svc power stayon）——熄屏后画面采集停摆、音频退化为静音包，
@@ -708,149 +552,4 @@ class WirelessSession {
   }
 }
 
-/* ---------------- WebSocket 端点 ---------------- */
-
-// 崩溃兑底：把未捕获异常/未处理的 Promise 拒绝落盘（此前服务进程曾静默退出，日志里零痕迹无法排查）
-process.on('uncaughtException', (err) => {
-  try { logger.error('[崩溃] 未捕获异常：' + (err && (err.stack || err.message) || err)); } catch {}
-});
-process.on('unhandledRejection', (reason) => {
-  try { logger.error('[崩溃] 未处理的 Promise 拒绝：' + (reason && (reason.stack || reason.message || reason))); } catch {}
-});
-
-function setupWireless(httpServer) {
-  const session = new WirelessSession();
-  // 进程退出时恢复手机亮屏策略（execSync 保证在 exit 事件里同步完成，否则会留下「屏幕常亮」的残留设置）
-  process.on('exit', () => {
-    if (session.keepAwakeOn && session.adbPath && session.serial) {
-      try {
-        require('child_process').execSync(`"${session.adbPath}" -s ${session.serial} shell svc power stayon false`, { stdio: 'ignore', timeout: 3000 });
-      } catch {}
-    }
-  });
-  // noServer 模式 + 自行路由：避免与 /ws 的 WebSocketServer 相互拒绝对方的 upgrade 请求
-  const wss = new WebSocketServer({ noServer: true });
-  wss.on('connection', (ws) => {
-    session.clients.add(ws);
-    if (session.state === 'streaming' && session.clients.size > 1) {
-      // 多端同时接收是允许的，但要提醒：每个页面都在独立解码+跑看门狗，
-      // 隐藏的旧标签页会成倍增加卡顿并触发多余的重启
-      session.log('⚠ 检测到 ' + session.clients.size + ' 个页面同时接收投屏（可能是旧标签页）。多端同时解码会成倍增加卡顿，建议关闭多余的标签页只保留一个');
-    }
-    // 新客户端：先发当前状态；投屏中则补发关键帧缓存，保证立即出画面
-    session.send(ws, { type: 'status', state: session.state, message: session.message });
-    if (session.qrPair) {
-      session.send(ws, { type: 'qr-pair-pending' });
-    }
-    if (session.state === 'streaming') {
-      const boot = session.cache.bootstrap();
-      if (boot && boot.length) ws.send(boot);
-      // 补发缓存的 OpusHead 音频配置包（只随投屏开始广播一次，中途接入/刷新的客户端没有它就永远无声）
-      if (session.lastAudioConfig && session.audioEnabled) {
-        session.send(ws, session.lastAudioConfig);
-      }
-    }
-    // 下发上次成功连接的地址（前端自动回填输入框并尝试自动连接）
-    const last = connStore.load();
-    if (last && session.state === 'idle') {
-      session.send(ws, { type: 'last-connection', addr: last.addr, savedAt: last.savedAt });
-    }
-    ws.on('message', (raw, isBinary) => {
-      if (isBinary) return;
-      let msg;
-      try { msg = JSON.parse(raw.toString()); } catch { return; }
-      const reply = (err) => session.fail(err);
-      switch (msg.type) {
-        case 'status':
-          session.send(ws, { type: 'status', state: session.state, message: session.message });
-          break;
-        case 'get-last-connection': {
-          const l = connStore.load();
-          session.send(ws, { type: 'last-connection', addr: l ? l.addr : '', savedAt: l ? l.savedAt : 0 });
-          break;
-        }
-        case 'pair':
-          session.pair(msg.addr, String(msg.code || '')).catch(reply);
-          break;
-        case 'qr-pair-start':
-          session.startQrPairing().catch(reply);
-          break;
-        case 'qr-pair-cancel':
-          session.cancelQrPairing();
-          break;
-        case 'connect':
-          session.connect(msg.addr || '').catch(reply);
-          break;
-        case 'start':
-          session.start({ bitrate: msg.bitrate, maxSize: msg.maxSize, maxFps: msg.maxFps }).catch(reply);
-          break;
-        case 'stop':
-          session.stop('已手动停止').catch(reply);
-          break;
-        case 'video-stall':
-          // 前端看门狗②③：视频流停滞且手机仍在出声 → 自动重启采集会话（30s 只重启一次）。
-          // 降载阶梯（10 分钟窗口）：停滞 ≥2 次 → 降码率；≥3 次 → 切换 Android 自带软件编码器
-          // （绕开 vivo 等厂商硬件编码器被系统冻结/出错的机型问题）+ 降至 30fps；
-          // 手动停止后重新开始投屏会重置阶梯（客户端发来的新参数覆盖 lastStartOptions）
-          if (session.state === 'streaming' && session.lastStartOptions) {
-            const stallNow = Date.now();
-            if (!session.lastVideoStallAt || stallNow - session.lastVideoStallAt > 30000) {
-              session.lastVideoStallAt = stallNow;
-              session.stallTimes = (session.stallTimes || []).filter((t) => stallNow - t < 600000);
-              session.stallTimes.push(stallNow);
-              const restartOpts = { ...session.lastStartOptions };
-              const n = session.stallTimes.length;
-              if (n > 5) {
-                // 重启风暴熔断：反复重建 MediaProjection 会话会刺激 vivo 等系统进一步限流，越重启越糟
-                if (stallNow - (session.lastCapLogAt || 0) > 60000) {
-                  session.lastCapLogAt = stallNow;
-                  session.log('⚠ 10 分钟内已自动重启 5 次仍未稳定：手机端采集正被系统反复中断，已暂停自动重启（避免投影会话反复重建加重限流）。请点「停止投屏」再重新开始（重置计数）；持续如此建议手机插线使用或检查省电策略');
-                  logger.info('[video-stall] 10 分钟内自动重启达 5 次，暂停自动重启');
-                }
-                break;
-              }
-              if (n >= 3 && !restartOpts.videoEncoder) {
-                restartOpts.videoEncoder = 'c2.android.avc.encoder';
-                restartOpts.bitrate = Math.min(restartOpts.bitrate || 6000000, 6000000);
-                restartOpts.maxFps = 30;
-                session.log('⚠ 10 分钟内停滞 ' + n + ' 次：疑似手机硬件编码器问题，已切换软件编码器（更稳，帧率降至 30fps）。若软件编码器仍频繁停滞，建议手机插线投屏（USB 连接最稳）或检查手机省电策略');
-                logger.info('[video-stall] 停滞 ' + n + ' 次，切换软件编码器 c2.android.avc.encoder / 30fps');
-              } else if (n >= 2 && restartOpts.bitrate && restartOpts.bitrate > 6000000) {
-                restartOpts.bitrate = Math.max(6000000, Math.floor(restartOpts.bitrate * 0.75));
-                session.log('⚠ 视频流频繁停滞，已自动降低码率至 ' + (restartOpts.bitrate / 1e6).toFixed(1) + ' Mbps（停止后重选画质档可恢复）');
-                logger.info('[video-stall] 10 分钟内第 ' + n + ' 次停滞，自适应降码率至 ' + (restartOpts.bitrate / 1e6).toFixed(1) + 'Mbps');
-              }
-              session.lastStartOptions = restartOpts;
-              logger.info('[video-stall] 浏览器端检测到视频流停滞（手机仍在出声），自动重启采集会话');
-              session.stop('视频流停滞，自动重启')
-                .then(() => session.start(restartOpts))
-                .catch((e) => logger.error('[video-stall] 自动重启失败：' + e.message));
-            }
-          }
-          break;
-        case 'client-log':
-          // 前端音频诊断回报：落盘到文件日志，便于事后定位「无声」到底断在哪一环
-          logger.info('[browser] ' + String(msg.message || '').slice(0, 300));
-          break;
-        default:
-          break;
-      }
-    });
-    ws.on('close', () => {
-      session.clients.delete(ws);
-    });
-    ws.on('error', () => {
-      session.clients.delete(ws);
-    });
-  });
-  httpServer.on('upgrade', (req, socket, head) => {
-    const pathname = (req.url || '').split('?')[0];
-    if (pathname === '/wireless') {
-      wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
-    }
-  });
-
-  return { wss, session };
-}
-
-module.exports = { setupWireless, WirelessSession, KeyframeCache, ScrcpyStreamReader, generateQrPairingSecrets, CODEC_H264, CODEC_OPUS, STREAM_DISABLE, STREAM_ERROR };
+module.exports = { WirelessSession };

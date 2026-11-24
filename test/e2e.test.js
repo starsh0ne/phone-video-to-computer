@@ -75,7 +75,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
   console.log('启动测试服务（HTTP ' + TEST_PORT_HTTP + ' / HTTPS ' + TEST_PORT_HTTPS + '）...');
-  const server = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'server.js')], {
+  const server = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
     env: {
       ...process.env,
       PORT_HTTP: String(TEST_PORT_HTTP),

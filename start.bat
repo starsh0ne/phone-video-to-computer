@@ -1,47 +1,47 @@
-@echo off
+﻿@echo off
 chcp 65001 >nul
-title local-cast 投屏服务
+title local-cast 鎶曞睆鏈嶅姟
 
 echo ==================================================
-echo    local-cast 本地投屏工具 启动中...
+echo    local-cast 鏈湴鎶曞睆宸ュ叿 鍚姩涓?..
 echo ==================================================
 echo.
 
 where node >nul 2>nul
 if errorlevel 1 (
-    echo [错误] 未检测到 Node.js，请先安装 Node.js 18 以上版本后重试。
-    echo 下载地址: https://nodejs.org/
+    echo [閿欒] 鏈娴嬪埌 Node.js锛岃鍏堝畨瑁?Node.js 18 浠ヤ笂鐗堟湰鍚庨噸璇曘€?
+    echo 涓嬭浇鍦板潃: https://nodejs.org/
     pause
     exit /b 1
 )
 
 if not exist "node_modules" (
-    echo 首次运行，正在安装依赖（仅一次，需要联网）...
+    echo 棣栨杩愯锛屾鍦ㄥ畨瑁呬緷璧栵紙浠呬竴娆★紝闇€瑕佽仈缃戯級...
     call npm install
     if errorlevel 1 (
-        echo [错误] 依赖安装失败，请检查网络后重试。
+        echo [閿欒] 渚濊禆瀹夎澶辫触锛岃妫€鏌ョ綉缁滃悗閲嶈瘯銆?
         pause
         exit /b 1
     )
 )
 
-echo 正在为投屏服务放行防火墙端口（8080 电脑端 / 8081 手机端，允许手机访问）...
-netsh advfirewall firewall add rule name="local-cast 投屏服务 HTTP" dir=in action=allow localport=8080 protocol=TCP >nul 2>nul
-netsh advfirewall firewall add rule name="local-cast 投屏服务 HTTPS" dir=in action=allow localport=8081 protocol=TCP >nul 2>nul
+echo 姝ｅ湪涓烘姇灞忔湇鍔℃斁琛岄槻鐏绔彛锛?080 鐢佃剳绔?/ 8081 鎵嬫満绔紝鍏佽鎵嬫満璁块棶锛?..
+netsh advfirewall firewall add rule name="local-cast 鎶曞睆鏈嶅姟 HTTP" dir=in action=allow localport=8080 protocol=TCP >nul 2>nul
+netsh advfirewall firewall add rule name="local-cast 鎶曞睆鏈嶅姟 HTTPS" dir=in action=allow localport=8081 protocol=TCP >nul 2>nul
 if errorlevel 1 (
-    echo 提示：防火墙规则未添加成功（可能已存在或需要管理员权限），如手机无法连接请手动放行 8080/8081 端口。
+    echo 鎻愮ず锛氶槻鐏瑙勫垯鏈坊鍔犳垚鍔燂紙鍙兘宸插瓨鍦ㄦ垨闇€瑕佺鐞嗗憳鏉冮檺锛夛紝濡傛墜鏈烘棤娉曡繛鎺ヨ鎵嬪姩鏀捐 8080/8081 绔彛銆?
 ) else (
-    echo 防火墙规则已放行。
+    echo 闃茬伀澧欒鍒欏凡鏀捐銆?
 )
 
-echo 正在启动投屏服务...
+echo 姝ｅ湪鍚姩鎶曞睆鏈嶅姟...
 echo.
-echo 启动后请在电脑浏览器打开：http://localhost:8080/
-echo ├─ Android 手机：接收页右侧「无线投屏」面板，按提示开启无线调试并配对（首次需联网下载工具）
-echo └─ iOS 27+ Safari：扫码直投（首次访问需点「继续前往」确认证书）
-echo 关闭本窗口或按 Ctrl+C 可停止服务。
+echo 鍚姩鍚庤鍦ㄧ數鑴戞祻瑙堝櫒鎵撳紑锛歨ttp://localhost:8080/
+echo 鈹溾攢 Android 鎵嬫満锛氭帴鏀堕〉鍙充晶銆屾棤绾挎姇灞忋€嶉潰鏉匡紝鎸夋彁绀哄紑鍚棤绾胯皟璇曞苟閰嶅锛堥娆￠渶鑱旂綉涓嬭浇宸ュ叿锛?
+echo 鈹斺攢 iOS 27+ Safari锛氭壂鐮佺洿鎶曪紙棣栨璁块棶闇€鐐广€岀户缁墠寰€銆嶇‘璁よ瘉涔︼級
+echo 鍏抽棴鏈獥鍙ｆ垨鎸?Ctrl+C 鍙仠姝㈡湇鍔°€?
 echo.
 
-node server\server.js
+node server\index.js
 
 pause

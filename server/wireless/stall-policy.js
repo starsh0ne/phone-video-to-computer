@@ -1,0 +1,69 @@
+/**
+ * 视频流停滞的降载阶梯与熔断策略（纯函数，无副作用，可单测）。
+ *
+ * 输入：10 分钟窗口内的停滞时刻数组 + 当前开流参数，输出：是否重启、新参数、要广播的消息。
+ * 阶梯（每级只升不降，手动停止后重新开始投屏即重置）：
+ *   10 分钟内第 1 次  → 仅重启会话（秒级恢复）
+ *   ≥ 2 次           → 码率降 25%（下限 6Mbps）
+ *   ≥ 3 次           → 切换 Android 自带软件编码器 c2.android.avc.encoder + 30fps
+ *                      （绕开 vivo 等厂商硬件编码器被系统冻结/出错的机型问题）
+ *   > 5 次           → 熔断：暂停自动重启。反复重建 MediaProjection 会话会刺激
+ *                      vivo 等系统进一步限流，越重启越糟；提示用户手动介入
+ */
+'use strict';
+
+const STALL_WINDOW_MS = 10 * 60 * 1000;   // 停滞统计窗口
+const MAX_RESTARTS_PER_WINDOW = 5;        // 窗口内自动重启上限（超过即熔断）
+const RESTART_MIN_GAP_MS = 30 * 1000;     // 两次自动重启的最小间隔
+
+/** 软件编码器：Android 12+ 全设备内置（CDD 要求），绕开厂商硬件编码器问题 */
+const SOFTWARE_ENCODER = 'c2.android.avc.encoder';
+
+/**
+ * @param {number[]} stallTimes 历史停滞时刻（Date.now 基准）
+ * @param {object}   options    当前开流参数（bitrate/maxSize/maxFps/videoEncoder…）
+ * @param {number}   now        本次停滞时刻
+ * @returns {{ restart: boolean, stallTimes: number[], restartOpts: object, messages: string[] }}
+ */
+function planStallRestart({ stallTimes, options, now }) {
+  const times = (stallTimes || []).filter((t) => now - t < STALL_WINDOW_MS);
+  times.push(now);
+  const opts = { ...options };
+  const n = times.length;
+  const messages = [];
+
+  if (n > MAX_RESTARTS_PER_WINDOW) {
+    messages.push(
+      '⚠ 10 分钟内已自动重启 ' + MAX_RESTARTS_PER_WINDOW + ' 次仍未稳定：手机端采集正被系统反复中断，' +
+      '已暂停自动重启（避免投影会话反复重建加重限流）。请点「停止投屏」再重新开始（重置计数）；' +
+      '持续如此建议手机插线使用或检查省电策略'
+    );
+    return { restart: false, stallTimes: times, restartOpts: opts, messages };
+  }
+
+  if (n >= 3 && !opts.videoEncoder) {
+    opts.videoEncoder = SOFTWARE_ENCODER;
+    opts.bitrate = Math.min(opts.bitrate || 6000000, 6000000);
+    opts.maxFps = 30;
+    messages.push(
+      '⚠ 10 分钟内停滞 ' + n + ' 次：疑似手机硬件编码器问题，已切换软件编码器（更稳，帧率降至 30fps）。' +
+      '若软件编码器仍频繁停滞，建议手机插线投屏（USB 连接最稳）或检查手机省电策略'
+    );
+  } else if (n >= 2 && opts.bitrate && opts.bitrate > 6000000) {
+    opts.bitrate = Math.max(6000000, Math.floor(opts.bitrate * 0.75));
+    messages.push(
+      '⚠ 视频流频繁停滞，已自动降低码率至 ' + (opts.bitrate / 1e6).toFixed(1) +
+      ' Mbps（停止后重选画质档可恢复）'
+    );
+  }
+
+  return { restart: true, stallTimes: times, restartOpts: opts, messages };
+}
+
+module.exports = {
+  planStallRestart,
+  STALL_WINDOW_MS,
+  MAX_RESTARTS_PER_WINDOW,
+  RESTART_MIN_GAP_MS,
+  SOFTWARE_ENCODER,
+};
