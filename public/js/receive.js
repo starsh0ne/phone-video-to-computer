@@ -431,11 +431,11 @@
     let lastReloadAt = 0;         // 最近一次自刷新页面时刻（Date.now 基准，5 分钟限频防刷新循环）
     try { lastReloadAt = Number(sessionStorage.getItem('wl-auto-reload-at') || 0); } catch {}
 
-    // 音画同步目标延迟：对齐音频环形缓冲水位；上限 350ms（音频深水位自动校正后水位≤600ms，
-    // 过大的目标只带来延迟不带来同步）；下限 60ms 保流畅。水位未上报前用 120ms 默认值
+    // 音画同步目标延迟：对齐音频环形缓冲水位；上限 300ms（链路突发式投递时水位常在 300-600 波动，
+    // 追随更高目标会放大呈现队列容量压力）；下限 60ms 保流畅。水位未上报前用 120ms 默认值
     function targetDelayMs() {
       const t = audioBufferMs > 0 ? audioBufferMs : 120;
-      return Math.min(350, Math.max(60, t));
+      return Math.min(300, Math.max(60, t));
     }
 
     function schedulePaint() {
@@ -483,13 +483,13 @@
       // FIFO 呈现 + 音画同步（v0.7.3）：丢掉明显过时的头部帧（> target+120ms）；
       // 首帧到龄（容差 30ms）即上屏——容差内的提前呈现避免突发到达时的「冻结→快进」节奏，
       // 平滑优先于严格同步
-      while (frameQueue.length > 1 && now - frameQueue[0].t > target + 120) {
+      while (frameQueue.length > 1 && now - frameQueue[0].t > target + 150) {
         const stale = frameQueue.shift();
         queueDrops++;
         try { stale.frame.close(); } catch {}
       }
       const head = frameQueue[0];
-      if (now - head.t < target - 30) {
+      if (now - head.t < target - 40) {
         // 首帧还没到龄：按到龄时间排队下一次上屏
         const wait = Math.max(5, Math.min(100, target - 30 - (now - head.t)));
         paintScheduled = true;
@@ -633,10 +633,10 @@
         output(frame) {
           // rAF 呈现：暂存最新帧（被更新的帧立即关闭，不留积压），vsync 时统一上屏
           // 音画同步呈现（v0.7.2）：解码帧入队，按到达年龄 ≈ 音频水位挑帧上屏；
-          // 队列过深（>12）丢最旧，防延迟累积与解码反压
+          // 队列过深（>16，低到达帧率下覆盖更长的目标延迟）丢最旧，防延迟累积与解码反压
           decodedWindow++;
           frameQueue.push({ frame, t: performance.now() });
-          while (frameQueue.length > 12) { const old = frameQueue.shift(); queueDrops++; try { old.frame.close(); } catch {} }
+          while (frameQueue.length > 16) { const old = frameQueue.shift(); queueDrops++; try { old.frame.close(); } catch {} }
           schedulePaint();
         },
         error(e) {
@@ -1122,7 +1122,13 @@
           } else if (wasStreaming) {
             resetDecoder();
             teardownAudio();
-            hideCanvas();
+            if (String(msg.message || '').indexOf('自动重启') !== -1) {
+              // 看门狗/阶梯触发的自动重启：新会话几秒内接上——保留最后一帧画面与提示，
+              // 不黑屏不清画（黑屏+清音频会让用户误以为“彻底断开”）
+              setStatus('画面重连中…（' + (msg.message || '') + '）');
+            } else {
+              hideCanvas();
+            }
             stopFps();
           }
         } else if (msg.type === 'last-connection') {
