@@ -342,6 +342,7 @@
 
     function onVideoData(chunk) {
       lastVideoDataTime = performance.now(); // 看门狗：区分「没数据」与「有数据不出帧」
+      videoBytesWindow += chunk.byteLength || 0; // 指标面板：到达码率统计
       const incoming = new Uint8Array(chunk);
       const merged = new Uint8Array(streamBuf.length + incoming.length);
       merged.set(streamBuf, 0);
@@ -403,18 +404,21 @@
       return null;
     }
 
-    // ---- 视频流畅性（v0.6.1）----
-    // 1) 解码积压控制：decodeQueueSize 超阈值即丢弃后续 delta 帧直到下一个关键帧（reset 后重同步），
-    //    延迟不累积——倍速播放/网络抖动时靠丢帧保节奏，而不是越播越卡
-    // 2) rAF 垂直同步呈现：解码出的帧先暂存，由 requestAnimationFrame 每个显示刷新周期画最新一帧，
-    //    帧到达抖动不再直接映射为画面抖动；倍速下帧间隔被压缩 1.5 倍，这一步是流畅的关键
-    let presentFrame = null;      // 待呈现的最新帧（旧的直接关闭，零等待）
+    // ---- 视频流畅性与音画同步 ----
+    // 1) 解码积压控制：decodeQueueSize 超阈值即丢弃后续 delta 帧直到下一个关键帧（reset 后重同步）
+    // 2) rAF 垂直同步呈现 + 到达年龄对齐：解码帧入队，按「到达年龄 ≈ 音频播放水位」挑帧上屏，
+    //    视频的到达→呈现延迟与音频的到达→播放延迟对齐（口型同步）；帧到达抖动被队列吸收
+    let frameQueue = [];          // 待呈现帧队列 [{frame, t}]，t = 解码输出时刻
     let paintScheduled = false;   // 是否已排队一次上屏（rAF 或定时器）
     let videoBacklogDrop = false; // 正在因积压丢帧（直到下个关键帧）
     let videoBacklogEvents = 0;   // 累计发生积压丢帧的次数（诊断用）
     let paintTimer = null;        // 页面不可见时 rAF 停摆的定时器兑底
     let lastPaintTime = 0;        // 最近一次上屏时刻（看门狗①）
     let lastVideoDataTime = 0;    // 最近一次收到视频数据时刻（看门狗②）
+    let videoBytesWindow = 0;     // 本统计窗口收到的视频字节数（指标面板：到达码率）
+    let rttMs = -1;               // WS 往返延迟（指标面板，每秒探测一次）
+    let streamInfo = null;        // 服务端流信息（链路类型/码率/帧率/编码器/熄屏，指标面板）
+    let audioBufferMs = 0;        // 环形缓冲水位（worklet 每秒上报，音画同步与面板共用）
     let lastAudioDataTime = 0;    // 最近一次收到音频数据时刻（看门狗②：音频活=采集进程活）
     let lastRebuildAt = 0;        // 最近一次强制重建解码器时刻（8s 门限防连环重建）
     let lastStallNotify = 0;      // 最近一次向服务端上报视频流停滞时刻（45s 门限）
@@ -425,6 +429,13 @@
     let lastReloadAt = 0;         // 最近一次自刷新页面时刻（Date.now 基准，5 分钟限频防刷新循环）
     try { lastReloadAt = Number(sessionStorage.getItem('wl-auto-reload-at') || 0); } catch {}
 
+    // 音画同步目标延迟：对齐音频环形缓冲水位；上限受队列容量约束（60fps 下 12 帧 ≈ 200ms），
+    // 下限 40ms 保流畅。水位未上报前用 120ms 默认值
+    function targetDelayMs() {
+      const t = audioBufferMs > 0 ? audioBufferMs : 120;
+      return Math.min(190, Math.max(40, t));
+    }
+
     function schedulePaint() {
       if (paintScheduled) return;
       paintScheduled = true;
@@ -434,13 +445,7 @@
       else requestAnimationFrame(paintFrame);
     }
 
-    function paintFrame() {
-      paintScheduled = false;
-      stallEscalation = 0; // 成功上屏 = 恢复健康，自愈升级级别归零
-      if (paintTimer) { clearTimeout(paintTimer); paintTimer = null; }
-      const frame = presentFrame;
-      presentFrame = null;
-      if (!frame) return;
+    function drawFrame(frame) {
       try {
         const c2d = canvasEl.getContext('2d');
         if (canvasEl.width !== frame.displayWidth || canvasEl.height !== frame.displayHeight) {
@@ -450,10 +455,47 @@
         c2d.drawImage(frame, 0, 0);
       } catch (e) {
         log('[解码] 绘制异常：' + e.message);
-      } finally {
-        try { frame.close(); } catch {}
       }
-      lastPaintTime = performance.now();
+    }
+
+    function paintFrame() {
+      paintScheduled = false;
+      stallEscalation = 0; // 成功上屏 = 恢复健康，自愈升级级别归零
+      if (paintTimer) { clearTimeout(paintTimer); paintTimer = null; }
+      if (!frameQueue.length) return;
+      if (document.hidden) {
+        // 不可见：只保最新帧（节流环境省资源，回前台时立刻有画面）
+        const newest = frameQueue[frameQueue.length - 1];
+        for (const it of frameQueue) { if (it !== newest) { try { it.frame.close(); } catch {} } }
+        frameQueue = [newest];
+        drawFrame(newest.frame);
+        try { newest.frame.close(); } catch {}
+        lastPaintTime = performance.now();
+        frameCount++;
+        showCanvas();
+        hintUpscale(canvasEl);
+        return;
+      }
+      const now = performance.now();
+      const target = targetDelayMs();
+      // 选第一帧年龄 ≥ 目标延迟的帧：更旧的已过时直接丢弃（音画同步 + 抖动吸收的核心）
+      let idx = -1;
+      for (let i = 0; i < frameQueue.length; i++) {
+        if (now - frameQueue[i].t >= target) { idx = i; break; }
+      }
+      if (idx === -1) {
+        // 所有帧都未到呈现时间：按「最早帧还差多久到龄」排队下一次上屏
+        const wait = Math.max(5, Math.min(200, target - (now - frameQueue[0].t)));
+        paintScheduled = true;
+        paintTimer = setTimeout(paintFrame, wait);
+        return;
+      }
+      const chosen = frameQueue[idx];
+      for (let i = 0; i < idx; i++) { try { frameQueue[i].frame.close(); } catch {} }
+      frameQueue = frameQueue.slice(idx + 1);
+      drawFrame(chosen.frame);
+      try { chosen.frame.close(); } catch {}
+      lastPaintTime = now;
       frameCount++;
       showCanvas();
       hintUpscale(canvasEl);
@@ -474,7 +516,7 @@
       }
       // reset/重建后解码器可能回到未配置态：配置后再送帧（否则 decode 抛 InvalidStateError）
       if (decoder.state === 'unconfigured') {
-        try { decoder.configure({ codec: 'avc1.42E01F' }); configuredCodec = 'avc1.42E01F'; } catch (e) { return; }
+        try { decoder.configure({ codec: 'avc1.42E01F', optimizeForLatency: true }); configuredCodec = 'avc1.42E01F'; } catch (e) { return; }
       }
       // v0.6.6：按 SPS 的真实 profile/level 配置——42E01F（Baseline L3.1）低于 1080p60 所需规格，
       // 部分硬件解码器对超规格码流会静默卡死（只积压不出帧、无错误回调），用真实规格配置是根治
@@ -482,7 +524,7 @@
         const realCodec = codecFromSps(sps);
         if (realCodec && configuredCodec !== realCodec) {
           try {
-            decoder.configure({ codec: realCodec });
+            decoder.configure({ codec: realCodec, optimizeForLatency: true });
             configuredCodec = realCodec;
             log('[解码] 已按码流实际规格配置解码器（' + realCodec + '）');
           } catch (e) { /* 用原配置继续 */ }
@@ -544,8 +586,8 @@
       keyChunkNeeded = true;
       videoBacklogDrop = false;
       rotationPending = false;
-      if (presentFrame) { try { presentFrame.close(); } catch {} }
-      presentFrame = null;
+      for (const it of frameQueue) { try { it.frame.close(); } catch {} }
+      frameQueue = [];
       ensureDecoder();
       configureIfNeeded();
       lastPaintTime = performance.now(); // 给下一个关键帧留宽限（连环重建由 lastRebuildAt 8s 门限兑底）
@@ -573,7 +615,7 @@
     window.addEventListener('resize', () => { upscaleHinted = false; if (canvasEl) hintUpscale(canvasEl); });
     // 页面重新可见：立刻排队一次上屏（后台期间 rAF 停摆，只靠节流定时器保底最新帧）
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden && presentFrame) schedulePaint();
+      if (!document.hidden && frameQueue.length) schedulePaint();
     });
 
     /* ---------- WebCodecs 解码器 ---------- */
@@ -586,8 +628,10 @@
       decoder = new VideoDecoder({
         output(frame) {
           // rAF 呈现：暂存最新帧（被更新的帧立即关闭，不留积压），vsync 时统一上屏
-          if (presentFrame) { try { presentFrame.close(); } catch {} }
-          presentFrame = frame;
+          // 音画同步呈现（v0.7.2）：解码帧入队，按到达年龄 ≈ 音频水位挑帧上屏；
+          // 队列过深（>12）丢最旧，防延迟累积
+          frameQueue.push({ frame, t: performance.now() });
+          while (frameQueue.length > 12) { const old = frameQueue.shift(); try { old.frame.close(); } catch {} }
           schedulePaint();
         },
         error(e) {
@@ -618,8 +662,8 @@
       lastVideoDataTime = 0;
       lastRebuildAt = 0;
       lastStallNotify = 0;
-      if (presentFrame) { try { presentFrame.close(); } catch {} }
-      presentFrame = null;
+      for (const it of frameQueue) { try { it.frame.close(); } catch {} }
+      frameQueue = [];
     }
 
     /* ---------- 音频（scrcpy Opus 48kHz 双声道 → WebCodecs → WebAudio） ----------
@@ -705,6 +749,7 @@
           const d = e.data || {};
           if (d.event === 'start') reportAudioState('环形缓冲起播（水位 150ms）');
           else if (d.event === 'underrun') reportAudioState('缓冲欠载一次（播放时钟保持连续，已自动接上）');
+          else if (d.event === 'buffer') audioBufferMs = d.ms || 0; // 每秒水位上报：指标面板 + 音画同步目标
           else if (d.event === 'bind-ack') workletBound = true;
         };
         audioWorkletNode.connect(audioGain);
@@ -1102,6 +1147,12 @@
           log('扫码配对正在进行中，如二维码未显示请点击「扫码配对」重新生成');
         } else if (msg.type === 'qr-pair-cancel') {
           hideQrZone();
+        } else if (msg.type === 'stream-info') {
+          // 服务端开流时的链路/编码信息（指标面板展示）
+          streamInfo = msg;
+        } else if (msg.type === 'pong') {
+          // RTT 探测回显：发送时刻与当前时刻差即往返延迟
+          rttMs = Math.max(0, Date.now() - (msg.t || Date.now()));
         } else if (msg.type === 'log') {
           log(msg.message);
         } else if (msg.type === 'error') {
@@ -1119,7 +1170,7 @@
       if (decoder.state === 'unconfigured') {
         // 码流为 Annex-B（无 description），SPS/PPS 在带内随关键帧送入，Chrome/Edge 可自动解析；
         // 首个关键帧到达后再按 SPS 真实规格重新配置（见 feedDecoder）
-        decoder.configure({ codec: 'avc1.42E01F' });
+        decoder.configure({ codec: 'avc1.42E01F', optimizeForLatency: true }); // 实时镜像：牺牲重排序缓冲换低延迟
         configuredCodec = 'avc1.42E01F';
         configured = true;
         startFps();
@@ -1136,9 +1187,34 @@
         $('info-fps').textContent = fps + ' fps (无线)';
         $('stat-text').textContent = canvasEl.width + '×' + canvasEl.height;
         frameCount = 0; fpsTime = now;
+        // ---- 指标面板（v0.7.2）：帧率/码率/解码队列/音频水位/RTT/链路与编码 ----
+        const metricsEl = document.getElementById('wl-metrics');
+        if (metricsEl) {
+          const kbps = sec > 0 ? Math.round(videoBytesWindow / sec / 1024) : 0;
+          const q = decoder ? decoder.decodeQueueSize : 0;
+          const link = streamInfo ? streamInfo.link : '';
+          const enc = configuredCodec || '';
+          const parts = [
+            '链路 ' + (link || '—') + (streamInfo && streamInfo.softwareEncoder ? '·软编' : ''),
+            '帧率 ' + fps,
+            '码率 ' + (kbps ? (kbps / 1024).toFixed(1) + 'Mbps' : '—'),
+            '队列 ' + q,
+            '音频水位 ' + (audioBufferMs ? Math.round(audioBufferMs) + 'ms' : '—'),
+            'RTT ' + (rttMs >= 0 ? Math.round(rttMs) + 'ms' : '—'),
+            '同步延迟 ' + Math.round(targetDelayMs()) + 'ms',
+            (stallEscalation > 0 ? '自愈 ' + stallEscalation + '级' : ''),
+          ].filter(Boolean);
+          metricsEl.style.display = 'block';
+          metricsEl.textContent = parts.join('  ·  ');
+        }
+        videoBytesWindow = 0;
+        // RTT 探测（每秒一次，轻量：仅在 WS 打开时发送）
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          try { ws.send(JSON.stringify({ type: 'ping', t: Date.now() })); } catch {}
+        }
         // ---- 卡屏看门狗 ----
         // ⓪ 渲染兑底：有待上屏帧但 1.2s 没画（rAF 挂起、排队标记永真）→ 定时器强制上屏打破死锁
-        if (presentFrame && lastPaintTime && now - lastPaintTime > 1200) {
+        if (frameQueue.length && lastPaintTime && now - lastPaintTime > 1200) {
           if (paintTimer) clearTimeout(paintTimer);
           paintTimer = setTimeout(paintFrame, 100);
         }
@@ -1247,16 +1323,22 @@
       sendSafe({ type: 'connect', addr });
       setStatus('正在连接…');
     };
-    // 恢复上次使用的画质档位（页面自刷新兑底后自动续播也用它）
+    // 恢复上次使用的画质档位与熄屏选项（页面自刷新兑底后自动续播也用它们）
     try {
       const savedQ = localStorage.getItem('wl-quality');
       if (savedQ) { const qel = document.getElementById('wl-quality'); if (qel) qel.value = savedQ; }
+      if (localStorage.getItem('wl-screen-off') === '1') {
+        const so = document.getElementById('wl-screen-off');
+        if (so) so.checked = true;
+      }
     } catch {}
     $('wl-btn-start').onclick = () => {
       resetDecoder();
       // 画质档位 → scrcpy 参数：max_size 0 = 手机原始分辨率；码率越高越清晰（占带宽越多）
       const q = $('wl-quality') ? $('wl-quality').value : 'high';
       try { localStorage.setItem('wl-quality', q); } catch {} // 持久化：页面自刷新兑底后自动续播用
+      const screenOff = !!document.getElementById('wl-screen-off')?.checked;
+      try { localStorage.setItem('wl-screen-off', screenOff ? '1' : '0'); } catch {}
       const presets = {
         high: { maxSize: 1920, bitrate: 16000000, maxFps: 60 },
         balanced: { maxSize: 1600, bitrate: 10000000, maxFps: 60 },
@@ -1264,7 +1346,7 @@
       };
       const preset = presets[q] || presets.high;
       upscaleHinted = false;
-      sendSafe({ type: 'start', maxSize: preset.maxSize, bitrate: preset.bitrate, maxFps: preset.maxFps });
+      sendSafe({ type: 'start', maxSize: preset.maxSize, bitrate: preset.bitrate, maxFps: preset.maxFps, screenOff });
     };
     $('wl-btn-stop').onclick = () => {
       sendSafe({ type: 'stop' });

@@ -47,6 +47,12 @@ class RingBufferProcessor extends AudioWorkletProcessor {
     const out = outputs[0];
     const L = out[0], R = out[1] || out[0];
     const n = L.length;
+    // 每约 1 秒上报一次缓冲水位（主线程指标面板 + 音画同步目标用；音频线程 postMessage 开销可控）
+    this.reportBlocks = (this.reportBlocks || 0) + 1;
+    if (this.reportBlocks >= 375) { // 48kHz / 128 采样块 ≈ 375 块/秒
+      this.reportBlocks = 0;
+      this.port.postMessage({ event: 'buffer', ms: Math.round(this.available / sampleRate * 1000) });
+    }
     if (!this.playing) {
       if (this.available >= sampleRate * 0.15) {
         this.playing = true;

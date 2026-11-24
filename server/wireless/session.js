@@ -245,13 +245,21 @@ class WirelessSession {
     }
   }
 
-  /** 通过 mDNS / 已连接设备自动发现并连接；postPair 时轮询多次（配对后 adb 自动连接需要几秒） */
+  /** 通过 USB 直连 / mDNS / 已连接设备自动发现并连接；postPair 时轮询多次（配对后 adb 自动连接需要几秒） */
   async tryAutoConnect(attempts = 1) {
     for (let i = 0; i < attempts; i++) {
       if (i > 0) await new Promise((r) => setTimeout(r, 1500));
       try {
         const adbPath = this.adbPath;
-        // 1. mDNS 发现无线调试服务
+        // 1. USB 直连设备优先（插入数据线即用，绕开无线链路全部不稳定性）
+        const list = await adbapi.devices(adbPath);
+        const usb = list.find((s) => !adbapi.isWirelessSerial(s));
+        if (usb) {
+          this.serial = usb;
+          this.setState('ready', '已通过 USB 连接：' + usb + '（最稳定链路），可以开始投屏');
+          return true;
+        }
+        // 2. mDNS 发现无线调试服务
         const services = await adbapi.mdnsServicesDetailed(adbPath);
         for (const s of services) {
           if (/_adb-tls-connect/.test(s.type)) {
@@ -263,9 +271,8 @@ class WirelessSession {
             } catch { /* 尝试下一个 */ }
           }
         }
-        // 2. adb devices 里已就绪的无线设备（ip:port 或 mDNS 服务名）——先探活再采信：
+        // 3. adb devices 里已就绪的无线设备（ip:port 或 mDNS 服务名）——先探活再采信：
         //    断开的旧传输可能在列表里残留「device」状态，直接采信会把失效端口写入缓存（v0.6.6）
-        const list = await adbapi.devices(adbPath);
         const wirelessList = list.filter((s) => adbapi.isWirelessSerial(s));
         for (const s of wirelessList) {
           const alive = await adbapi.shell(adbPath, s, 'echo ok').catch(() => false);
@@ -311,6 +318,8 @@ class WirelessSession {
       this.setState('connecting', '正在启动屏幕采集…');
       this.cache.reset();
       const wantAudio = options.audio !== false;
+      const wantScreenOff = options.screenOff === true; // 熄屏投屏（需 control 通道，见下方第三条 socket）
+      if (wantScreenOff) this.screenOffUsed = true; // stop()/进程退出时强制唤醒兑底
       this.serverProc = adbapi.startScrcpyServer(adbPath, serial, tools.SCRCPY_VERSION, {
         bitrate: options.bitrate,
         maxSize: options.maxSize,
@@ -318,6 +327,8 @@ class WirelessSession {
         audio: wantAudio,
         remotePath: SCRCPY_REMOTE_PATH,
         videoEncoder: options.videoEncoder, // v0.6.9 阶梯第③级：软件编码器（补全透传）
+        control: wantScreenOff,
+        turnScreenOff: wantScreenOff,
       });
       logger.info('[scrcpy 启动命令] ' + this.serverProc.cmd);
       // v0.6.5：投屏期间保持手机亮屏（svc power stayon）——熄屏后画面采集停摆、音频退化为静音包，
@@ -499,7 +510,52 @@ class WirelessSession {
         }
       }
 
+      // --- 控制 socket（仅熄屏投屏启用 control 时）：scrcpy 在 video→audio 之后 accept 第三条 ---
+      // 控制通道是双向的，当前只接收不发送（剪贴板同步等设备→电脑消息，一律排空忽略）
+      this.controlSocket = null;
+      if (wantScreenOff) {
+        const openControlStream = () => new Promise((resolve, reject) => {
+          const deadline = Date.now() + 10000;
+          const attempt = () => {
+            if (!this.serverProc) { reject(new Error('scrcpy-server 启动失败或已退出')); return; }
+            const sock = net.connect(this.forwardPort, '127.0.0.1');
+            let stable = false;
+            const retry = () => {
+              if (stable) return;
+              sock.destroy();
+              if (Date.now() > deadline) reject(new Error('控制通道连接失败'));
+              else setTimeout(attempt, 300);
+            };
+            sock.once('error', (err) => retry(err.message));
+            sock.once('close', () => retry('连接被关闭'));
+            sock.once('connect', () => {
+              // adb forward 会先本地 accept、发现远端未就绪即断开：连接后稳定 300ms 才算建立
+              // （控制通道没有首字节可等，用存活时延代确认）
+              setTimeout(() => { stable = true; resolve(sock); }, 300);
+            });
+          };
+          attempt();
+        });
+        try {
+          this.controlSocket = await openControlStream();
+          this.controlSocket.on('data', () => {}); // 排空设备→电脑消息
+          this.controlSocket.once('error', () => {}); // 断开不影响投屏（只损失熄屏后恢复时机）
+        } catch (err) {
+          // 控制通道建不起来：scrcpy 会一直等 accept，编码器不会启动 → 整体失败比半残好
+          throw err;
+        }
+      }
+
       this.setState('streaming', '投屏中 · ' + serial + (this.audioEnabled ? '（含声音）' : ''));
+      // 流信息广播（前端指标面板展示：链路类型/码率/帧率/编码器/熄屏）
+      this.broadcast({
+        type: 'stream-info',
+        link: /^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(serial) ? 'wifi' : 'usb',
+        bitrate: options.bitrate,
+        maxFps: options.maxFps,
+        softwareEncoder: !!options.videoEncoder,
+        screenOff: wantScreenOff,
+      });
       // 状态推送完成后再投递建立期间缓冲的视频数据，保证前端先进入 streaming 再收到码流
       live = true;
       for (const chunk of buffered) {
@@ -524,6 +580,15 @@ class WirelessSession {
     if (this.audioSocket) {
       try { this.audioSocket.destroy(); } catch {}
       this.audioSocket = null;
+    }
+    if (this.controlSocket) {
+      try { this.controlSocket.destroy(); } catch {}
+      this.controlSocket = null;
+    }
+    if (this.screenOffUsed) {
+      // 熄屏投屏恢复：scrcpy 正常退出会自行恢复电源状态，这里强制唤醒兑底（防强杀残留黑屏）
+      this.screenOffUsed = false;
+      try { await adbapi.shell(this.adbPath, this.serial, 'input keyevent 224'); } catch {}
     }
     this.audioEnabled = false;
     clearInterval(this.audioStatsTimer);

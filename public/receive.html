@@ -107,9 +107,16 @@
           <option value="native">原生 · 手机原始分辨率 / 20Mbps</option>
         </select>
       </div>
+      <div class="field" style="margin-top:10px">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input type="checkbox" id="wl-screen-off" style="width:auto">
+          熄屏投屏（手机黑屏省电，电脑继续看；需 USB 或点击手机弹窗允许控制）
+        </label>
+      </div>
       <button class="wl-btn" id="wl-btn-start" disabled>开 始 投 屏</button>
       <button class="wl-btn secondary" id="wl-btn-stop" disabled>停止投屏</button>
       <div class="wl-status" id="wl-status">未连接</div>
+      <div id="wl-metrics" class="wl-status" style="display:none;font-size:12px;opacity:.9;line-height:1.7"></div>
       <div class="wl-log" id="wl-log"></div>
       <div class="wl-steps">
         首次使用会自动下载 adb 与 scrcpy-server（约 5MB + 60KB），需联网；之后完全离线可用。投屏期间手机电脑需同一 Wi-Fi，或手机连电脑热点。

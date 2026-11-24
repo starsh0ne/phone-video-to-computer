@@ -23,11 +23,16 @@ process.on('unhandledRejection', (reason) => {
 
 function setupWireless(httpServer) {
   const session = new WirelessSession();
-  // 进程退出时恢复手机亮屏策略（execSync 保证在 exit 事件里同步完成，否则会留下「屏幕常亮」的残留设置）
+  // 进程退出时恢复手机亮屏策略与唤醒（execSync 保证在 exit 事件里同步完成，否则会留下残留状态）
   process.on('exit', () => {
     if (session.keepAwakeOn && session.adbPath && session.serial) {
       try {
         require('child_process').execSync(`"${session.adbPath}" -s ${session.serial} shell svc power stayon false`, { stdio: 'ignore', timeout: 3000 });
+      } catch {}
+    }
+    if (session.screenOffUsed && session.adbPath && session.serial) {
+      try {
+        require('child_process').execSync(`"${session.adbPath}" -s ${session.serial} shell input keyevent 224`, { stdio: 'ignore', timeout: 3000 });
       } catch {}
     }
   });
@@ -85,7 +90,17 @@ function setupWireless(httpServer) {
           session.connect(msg.addr || '').catch(reply);
           break;
         case 'start':
-          session.start({ bitrate: msg.bitrate, maxSize: msg.maxSize, maxFps: msg.maxFps, videoEncoder: msg.videoEncoder }).catch(reply);
+          session.start({
+            bitrate: msg.bitrate,
+            maxSize: msg.maxSize,
+            maxFps: msg.maxFps,
+            videoEncoder: msg.videoEncoder,
+            screenOff: msg.screenOff === true, // v0.7.2 熄屏投屏（前端勾选）
+          }).catch(reply);
+          break;
+        case 'ping':
+          // 前端指标面板的 RTT 探测：原样回显时间戳
+          session.send(ws, { type: 'pong', t: msg.t });
           break;
         case 'stop':
           session.stop('已手动停止').catch(reply);
