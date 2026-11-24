@@ -1135,7 +1135,7 @@
           } else if (wasStreaming) {
             resetDecoder();
             teardownAudio();
-            if (String(msg.message || '').indexOf('自动重启') !== -1) {
+            if (String(msg.message || '').indexOf('自动重启') !== -1 || String(msg.message || '').indexOf('自动切换') !== -1) {
               // 看门狗/阶梯触发的自动重启：新会话几秒内接上——保留最后一帧画面与提示，
               // 不黑屏不清画（黑屏+清音频会让用户误以为“彻底断开”）
               setStatus('画面重连中…（' + (msg.message || '') + '）');

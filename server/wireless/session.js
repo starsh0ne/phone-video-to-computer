@@ -556,6 +556,28 @@ class WirelessSession {
         softwareEncoder: !!options.videoEncoder,
         screenOff: wantScreenOff,
       });
+      // USB 热切换（v0.7.7）：Wi-Fi 投屏期间插入数据线（开 USB 调试）→ 自动迁移到 USB 链路。
+      // 每 5s 探测一次 adb devices；切换动作 = 停当前会话 + 用 USB serial 重开（同参数）
+      if (this.usbWatchTimer) clearInterval(this.usbWatchTimer);
+      this.usbWatchTimer = null;
+      if (/^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(serial)) {
+        this.usbWatchTimer = setInterval(async () => {
+          if (this.state !== 'streaming' || !this.usbWatchTimer) return;
+          try {
+            const list = await adbapi.devices(adbPath);
+            const usb = list.find((s) => !adbapi.isWirelessSerial(s));
+            if (usb && this.state === 'streaming') {
+              clearInterval(this.usbWatchTimer);
+              this.usbWatchTimer = null;
+              this.log('🔌 检测到 USB 连接（' + usb + '），自动切换到 USB 链路…');
+              this.serial = usb;
+              const switchOpts = { ...this.lastStartOptions };
+              await this.stop('检测到 USB 连接，自动切换链路');
+              await this.start(switchOpts);
+            }
+          } catch { /* 探测失败下一轮再试 */ }
+        }, 5000);
+      }
       // 状态推送完成后再投递建立期间缓冲的视频数据，保证前端先进入 streaming 再收到码流
       live = true;
       for (const chunk of buffered) {
@@ -593,6 +615,7 @@ class WirelessSession {
     this.audioEnabled = false;
     clearInterval(this.audioStatsTimer);
     this.audioStatsTimer = null;
+    if (this.usbWatchTimer) { clearInterval(this.usbWatchTimer); this.usbWatchTimer = null; }
     this.audioMediaTotal = 0;
     this.audioWindow = { packets: 0, bytes: 0 };
     this.lastAudioConfig = null;
