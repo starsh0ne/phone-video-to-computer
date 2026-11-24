@@ -12,6 +12,18 @@
 
 
 
+
+## [v0.7.1] - 2026-11-24
+
+### 重构：代码库结构优化（零功能变更，零构建依赖）
+
+- **服务端模块化**：`wireless.js`（751 行）拆为 `wireless/` 六模块（session 状态机 / stream-reader 协议解析 / keyframe-cache / pairing / stall-policy 停滞策略 / ws-endpoint），门面 `wireless/index.js` 保持旧导入面；`server.js` 拆为 `index.js`（薄入口）+ `config.js` + `cert.js` + `cast-code.js`；入口改为 `server/index.js`（start.bat/npm start/e2e 已同步）
+- **前端抽离**：`receive.html` 1683 → 114 行；样式 → `css/receive.css`；主脚本 → `js/receive.js`；音频 Worker/Worklet 由 Blob 模板字符串改为真实文件 `js/audio-worker.js` / `js/audio-worklet.js`（new Worker(url) / addModule(url)，行为等价）
+- **停滞策略纯函数化**：降载阶梯与熔断抽为 `stall-policy.js` 纯函数，新增 7 项单测（阶梯各级/窗口隔离/副本语义）
+- **崩溃可观测验证**：重构期间引入的 connStore 缺失被 uncaughtException 兜底当场捕获落盘（v0.6.8 机制实战生效）
+- **顺带补全**：`session.start()` 参数透传补上 `videoEncoder`（v0.6.9 阶梯第③级的软件编码器此前从未真正传到 adb 层）
+- **文档**：新增 `docs/architecture.md`（模块职责/数据流/关键不变量/修改入口速查），README 挂链接
+- 验证：44 项测试全过（e2e 16 + 单元 21 + 策略 7）；浏览器实测页面加载/WS 连接/自动发现/错误回报正常
 ## [v0.7.0] - 2026-11-23
 
 ### 优化：多端接收治理 + 重启风暴熔断（针对「放大后卡顿更频繁」）
