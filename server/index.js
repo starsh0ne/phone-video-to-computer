@@ -19,6 +19,7 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const { execSync } = require('child_process');
 const { PORT_HTTP, PORT_HTTPS, PUBLIC_DIR, MIME, getLanIP } = require('./config');
 const { ensureCert } = require('./cert');
 const castCode = require('./cast-code');
@@ -107,12 +108,59 @@ for (const server of [httpServer, httpsServer]) {
 
 /* ---------------- 启动 ---------------- */
 
-function onListenError(port, label) {
+/** 找到占用指定端口的 PID 列表（netstat -ano 解析） */
+function findPortPids(port) {
+  try {
+    const out = execSync('netstat -ano', { encoding: 'utf8', timeout: 5000 });
+    const pids = new Set();
+    for (const line of out.split(/\r?\n/)) {
+      if (!/LISTENING/i.test(line)) continue;
+      const m = line.trim().match(/^(?:TCP\s+\S+?:)(\d+)\s+\S+\s+LISTENING\s+(\d+)$/i);
+      if (m && Number(m[1]) === port) pids.add(Number(m[2]));
+    }
+    return [...pids];
+  } catch { return []; }
+}
+
+/** 确认该 PID 是本项目的旧实例（命令行含 server/index.js 或 server/server.js），避免误杀无关 node 进程 */
+function isOwnServerProcess(pid) {
+  try {
+    const out = execSync(
+      `powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine"`,
+      { encoding: 'utf8', timeout: 8000 }
+    );
+    const cmd = String(out || '');
+    return cmd.indexOf('server/index.js') !== -1
+      || cmd.indexOf('server\\index.js') !== -1
+      || cmd.indexOf('server/server.js') !== -1
+      || cmd.indexOf('server\\server.js') !== -1;
+  } catch { return false; }
+}
+
+function onListenError(port, label, server) {
+  let retries = 0;
   return (err) => {
+    // 端口被上次未正常关闭的 local-cast 实例占用：自动结束旧实例并重启（最多重试 3 次）。
+    // 只结束「命令行确认是本项目入口」的进程，避免误伤无关 node 服务
+    if (err && err.code === 'EADDRINUSE' && retries < 3) {
+      retries++;
+      const pids = findPortPids(port).filter((pid) => isOwnServerProcess(pid));
+      if (pids.length) {
+        console.error(` [自动修复] ${label}端口 ${port} 被上次未关闭的 local-cast 实例占用（PID ${pids.join(', ')}），正在结束并自动重启…`);
+        for (const pid of pids) {
+          try { execSync(`taskkill /T /F /PID ${pid}`, { stdio: 'ignore', timeout: 5000 }); } catch {}
+        }
+        setTimeout(() => { try { server.listen(port); } catch {} }, 1500);
+        return;
+      }
+      // 另一个端口的处理可能正在结束旧实例：稍候重试一次
+      setTimeout(() => { try { server.listen(port); } catch {} }, 1500);
+      return;
+    }
     if (err && err.code === 'EADDRINUSE') {
       console.error('==================================================');
-      console.error(` [启动失败] ${label}端口 ${port} 已被占用。`);
-      console.error(' 可能是上一次的服务仍在运行，请先关闭旧窗口，');
+      console.error(` [启动失败] ${label}端口 ${port} 已被占用，且自动修复未能接管。`);
+      console.error(' 占用者可能不是本工具的进程，请手动关闭后重试，');
       console.error(' 或改用其他端口启动：set PORT_HTTP=8090 set PORT_HTTPS=8091 && npm start');
       console.error('==================================================');
       process.exit(1);
@@ -121,8 +169,8 @@ function onListenError(port, label) {
   };
 }
 
-httpServer.on('error', onListenError(PORT_HTTP, 'HTTP '));
-httpsServer.on('error', onListenError(PORT_HTTPS, 'HTTPS '));
+httpServer.on('error', onListenError(PORT_HTTP, 'HTTP ', httpServer));
+httpsServer.on('error', onListenError(PORT_HTTPS, 'HTTPS ', httpsServer));
 
 httpServer.listen(PORT_HTTP);
 httpsServer.listen(PORT_HTTPS, () => {
