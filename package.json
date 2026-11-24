@@ -1,6 +1,6 @@
 {
   "name": "local-cast",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "本地开源投屏工具：手机投屏到电脑，支持投屏码/二维码连接，同一局域网 WebRTC 点对点直连",
   "main": "server/index.js",
   "scripts": {
