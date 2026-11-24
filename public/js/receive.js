@@ -419,6 +419,8 @@
     let rttMs = -1;               // WS 往返延迟（指标面板，每秒探测一次）
     let streamInfo = null;        // 服务端流信息（链路类型/码率/帧率/编码器/熄屏，指标面板）
     let audioBufferMs = 0;        // 环形缓冲水位（worklet 每秒上报，音画同步与面板共用）
+    let decodedWindow = 0;        // 本窗口解码输出帧数（指标面板：到达帧率，与呈现帧率分离）
+    let queueDrops = 0;           // 本窗口呈现队列丢弃帧数（头部过时 + 容量溢出）
     let lastAudioDataTime = 0;    // 最近一次收到音频数据时刻（看门狗②：音频活=采集进程活）
     let lastRebuildAt = 0;        // 最近一次强制重建解码器时刻（8s 门限防连环重建）
     let lastStallNotify = 0;      // 最近一次向服务端上报视频流停滞时刻（45s 门限）
@@ -429,11 +431,11 @@
     let lastReloadAt = 0;         // 最近一次自刷新页面时刻（Date.now 基准，5 分钟限频防刷新循环）
     try { lastReloadAt = Number(sessionStorage.getItem('wl-auto-reload-at') || 0); } catch {}
 
-    // 音画同步目标延迟：对齐音频环形缓冲水位；上限受队列容量约束（60fps 下 12 帧 ≈ 200ms），
-    // 下限 40ms 保流畅。水位未上报前用 120ms 默认值
+    // 音画同步目标延迟：对齐音频环形缓冲水位；上限 350ms（音频深水位自动校正后水位≤600ms，
+    // 过大的目标只带来延迟不带来同步）；下限 60ms 保流畅。水位未上报前用 120ms 默认值
     function targetDelayMs() {
       const t = audioBufferMs > 0 ? audioBufferMs : 120;
-      return Math.min(190, Math.max(40, t));
+      return Math.min(350, Math.max(60, t));
     }
 
     function schedulePaint() {
@@ -478,23 +480,25 @@
       }
       const now = performance.now();
       const target = targetDelayMs();
-      // 选第一帧年龄 ≥ 目标延迟的帧：更旧的已过时直接丢弃（音画同步 + 抖动吸收的核心）
-      let idx = -1;
-      for (let i = 0; i < frameQueue.length; i++) {
-        if (now - frameQueue[i].t >= target) { idx = i; break; }
+      // FIFO 呈现 + 音画同步（v0.7.3）：丢掉明显过时的头部帧（> target+120ms）；
+      // 首帧到龄（容差 30ms）即上屏——容差内的提前呈现避免突发到达时的「冻结→快进」节奏，
+      // 平滑优先于严格同步
+      while (frameQueue.length > 1 && now - frameQueue[0].t > target + 120) {
+        const stale = frameQueue.shift();
+        queueDrops++;
+        try { stale.frame.close(); } catch {}
       }
-      if (idx === -1) {
-        // 所有帧都未到呈现时间：按「最早帧还差多久到龄」排队下一次上屏
-        const wait = Math.max(5, Math.min(200, target - (now - frameQueue[0].t)));
+      const head = frameQueue[0];
+      if (now - head.t < target - 30) {
+        // 首帧还没到龄：按到龄时间排队下一次上屏
+        const wait = Math.max(5, Math.min(100, target - 30 - (now - head.t)));
         paintScheduled = true;
         paintTimer = setTimeout(paintFrame, wait);
         return;
       }
-      const chosen = frameQueue[idx];
-      for (let i = 0; i < idx; i++) { try { frameQueue[i].frame.close(); } catch {} }
-      frameQueue = frameQueue.slice(idx + 1);
-      drawFrame(chosen.frame);
-      try { chosen.frame.close(); } catch {}
+      frameQueue.shift();
+      drawFrame(head.frame);
+      try { head.frame.close(); } catch {}
       lastPaintTime = now;
       frameCount++;
       showCanvas();
@@ -629,9 +633,10 @@
         output(frame) {
           // rAF 呈现：暂存最新帧（被更新的帧立即关闭，不留积压），vsync 时统一上屏
           // 音画同步呈现（v0.7.2）：解码帧入队，按到达年龄 ≈ 音频水位挑帧上屏；
-          // 队列过深（>12）丢最旧，防延迟累积
+          // 队列过深（>12）丢最旧，防延迟累积与解码反压
+          decodedWindow++;
           frameQueue.push({ frame, t: performance.now() });
-          while (frameQueue.length > 12) { const old = frameQueue.shift(); try { old.frame.close(); } catch {} }
+          while (frameQueue.length > 12) { const old = frameQueue.shift(); queueDrops++; try { old.frame.close(); } catch {} }
           schedulePaint();
         },
         error(e) {
@@ -750,6 +755,7 @@
           if (d.event === 'start') reportAudioState('环形缓冲起播（水位 150ms）');
           else if (d.event === 'underrun') reportAudioState('缓冲欠载一次（播放时钟保持连续，已自动接上）');
           else if (d.event === 'buffer') audioBufferMs = d.ms || 0; // 每秒水位上报：指标面板 + 音画同步目标
+          else if (d.event === 'buffer-correct') reportAudioState('音频延迟校正：丢弃 ' + (d.droppedMs || 0) + 'ms 旧数据以恢复同步（水位曾超 600ms，会有一次轻微跳跃）');
           else if (d.event === 'bind-ack') workletBound = true;
         };
         audioWorkletNode.connect(audioGain);
@@ -1187,27 +1193,30 @@
         $('info-fps').textContent = fps + ' fps (无线)';
         $('stat-text').textContent = canvasEl.width + '×' + canvasEl.height;
         frameCount = 0; fpsTime = now;
-        // ---- 指标面板（v0.7.2）：帧率/码率/解码队列/音频水位/RTT/链路与编码 ----
+        // ---- 指标面板（v0.7.3）：到达/呈现帧率分离、真实码率、丢弃计数、音画差 ----
         const metricsEl = document.getElementById('wl-metrics');
         if (metricsEl) {
-          const kbps = sec > 0 ? Math.round(videoBytesWindow / sec / 1024) : 0;
+          const mbps = sec > 0 ? (videoBytesWindow * 8 / 1e6 / sec) : 0;
           const q = decoder ? decoder.decodeQueueSize : 0;
           const link = streamInfo ? streamInfo.link : '';
-          const enc = configuredCodec || '';
+          const inFps = sec > 0 ? Math.round(decodedWindow / sec) : 0;
+          const syncErr = audioBufferMs ? Math.round(audioBufferMs - targetDelayMs()) : 0;
           const parts = [
             '链路 ' + (link || '—') + (streamInfo && streamInfo.softwareEncoder ? '·软编' : ''),
-            '帧率 ' + fps,
-            '码率 ' + (kbps ? (kbps / 1024).toFixed(1) + 'Mbps' : '—'),
-            '队列 ' + q,
-            '音频水位 ' + (audioBufferMs ? Math.round(audioBufferMs) + 'ms' : '—'),
+            '到达 ' + inFps + ' / 呈现 ' + fps + ' fps',
+            '码率 ' + (mbps ? mbps.toFixed(1) + 'Mbps' : '—'),
+            '队列 ' + q + (queueDrops ? '，丢' + queueDrops : ''),
+            '水位 ' + (audioBufferMs ? Math.round(audioBufferMs) + 'ms' : '—'),
             'RTT ' + (rttMs >= 0 ? Math.round(rttMs) + 'ms' : '—'),
-            '同步延迟 ' + Math.round(targetDelayMs()) + 'ms',
-            (stallEscalation > 0 ? '自愈 ' + stallEscalation + '级' : ''),
+            '音画差 ' + syncErr + 'ms',
+            (stallEscalation > 0 ? '自愈' + stallEscalation + '级' : ''),
           ].filter(Boolean);
           metricsEl.style.display = 'block';
-          metricsEl.textContent = parts.join('  ·  ');
+          metricsEl.textContent = parts.join(' · ');
         }
         videoBytesWindow = 0;
+        decodedWindow = 0;
+        queueDrops = 0;
         // RTT 探测（每秒一次，轻量：仅在 WS 打开时发送）
         if (ws && ws.readyState === WebSocket.OPEN) {
           try { ws.send(JSON.stringify({ type: 'ping', t: Date.now() })); } catch {}

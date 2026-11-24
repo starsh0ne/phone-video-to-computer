@@ -29,11 +29,16 @@ class RingBufferProcessor extends AudioWorkletProcessor {
     };
   }
   writeRing(data, n) {
-    // 缓冲过深（>800ms）时丢最旧 100ms，限制延迟累积
-    if (this.available > sampleRate * 0.8) {
-      const drop = Math.floor(sampleRate * 0.1);
-      this.readPos = (this.readPos + drop) % this.cap;
-      this.available -= drop;
+    // 深水位延迟校正（v0.7.3）：网络突发后的追赶会把水位顶到 600ms+ 且永不回落
+    // （稳态下到达=消耗速率，多余延迟无法自愈）——一次性丢到 300ms 恢复低延迟。
+    // 音频会有一次轻微跳跃，但消除持续的音画偏移
+    if (this.available > sampleRate * 0.6) {
+      const excess = this.available - Math.floor(sampleRate * 0.3);
+      if (excess > 0) {
+        this.readPos = (this.readPos + excess) % this.cap;
+        this.available -= excess;
+        this.port.postMessage({ event: 'buffer-correct', droppedMs: Math.round(excess / sampleRate * 1000) });
+      }
     }
     // 逐帧写（交错数据跨环形边界不错位）
     for (let f = 0; f < n; f++) {
