@@ -465,7 +465,7 @@ class WirelessSession {
         : await openStream('视频', handleVideoChunk);
       this.videoSocket = videoSocket;
       videoSocket.once('close', () => {
-        if (this.state === 'streaming') {
+        if (this.state === 'streaming' && !this.stopping) {
           if (this.screenOffSentAt && Date.now() - this.screenOffSentAt < 8000) {
             this.log('⚠ 熄屏指令发出后通道立即断开：此 scrcpy 版本的熄屏协议不兼容，请取消勾选「熄屏投屏」后重试');
           }
@@ -473,7 +473,7 @@ class WirelessSession {
         }
       });
       videoSocket.once('error', () => {
-        if (this.state === 'streaming') this.stop('视频通道断开');
+        if (this.state === 'streaming' && !this.stopping) this.stop('视频通道断开');
       });
 
       // --- 音频 socket：解析帧头，提取 Opus 包转发（开启音频时才有第二条 socket）---
@@ -616,6 +616,18 @@ class WirelessSession {
 
   /* ---------- 停止 ---------- */
   async stop(reason = '已停止') {
+    // 防重入：stop 进行中时旧 socket 的 close/error 事件会再次触发 stop（USB 热切换实测
+    // 会嵌套破坏新会话的转发端口导致「启动失败」），嵌套调用直接忽略
+    if (this.stopping) return;
+    this.stopping = true;
+    try {
+      await this.stopInner(reason);
+    } finally {
+      this.stopping = false;
+    }
+  }
+
+  async stopInner(reason = '已停止') {
     if (this.qrPair) this.cancelQrPairing();
     if (this.videoSocket) {
       try { this.videoSocket.destroy(); } catch {}

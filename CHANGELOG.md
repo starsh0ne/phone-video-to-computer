@@ -20,6 +20,14 @@
 
 
 
+
+## [v0.7.9] - 2026-11-24
+
+### fix: 熄屏投屏三 socket 死锁（点开始投屏永久卡 connecting）
+
+- **根因（v0.7.8 实测）**：control=true 时 scrcpy 要等视频/音频/控制三条 socket 全部 accept 才开始编码出流，而原代码音频 socket 用「等首字节」确认——首字节永远不会来（编码器还没启动），控制 socket 又排在音频之后 → 三方互等死锁，会话永久卡 connecting（按钮随后禁用，表现为「点开始没反应」）
+- **修复**（`server/wireless/session.js`）：新增 `openChannel`（连接成功且稳定 300ms 即建立，close/error 重试语义一致）；control=true 时视频/音频/控制三条通道全部改走 openChannel 按 accept 顺序连接，编码器正常启动；非熄屏模式保持原 openStream 等首字节确认不变
+- 44 项测试全过
 ## [v0.7.8] - 2026-11-24
 
 ### fix: 熄屏投屏改走控制消息（scrcpy-server 5.x 已移除 turn_screen_off 参数）
