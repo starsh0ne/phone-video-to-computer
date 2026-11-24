@@ -6,6 +6,7 @@
 
 const { WebSocketServer } = require('ws');
 const logger = require('../logger');
+const connStore = require('../connection-store');
 const { WirelessSession } = require('./session');
 const {
   planStallRestart,
