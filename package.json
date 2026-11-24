@@ -5,7 +5,7 @@
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
-    "test": "node test/e2e.test.js && node test/wireless.test.js"
+    "test": "node test/e2e.test.js && node test/wireless.test.js && node test/stall-policy.test.js"
   },
   "keywords": [
     "cast",
