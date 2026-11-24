@@ -2,6 +2,7 @@
 class RingBufferProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
+    this.correctionEnabled = true; // 深水位校正开关（主线程在链路抖动风暴时可关闭）
     this.cap = Math.ceil(sampleRate * 1.0);
     this.buf = new Float32Array(this.cap * 2); // 立体声交错
     this.writePos = 0;
@@ -16,6 +17,9 @@ class RingBufferProcessor extends AudioWorkletProcessor {
       } else if (d.cmd === 'flush') {
         this.writePos = 0; this.readPos = 0; this.available = 0; this.playing = false;
         if (this.dataPort) { try { this.dataPort.close(); } catch (err) {} this.dataPort = null; }
+      } else if (d.cmd === 'set-correction') {
+        // 主线程检测到校正风暴（链路抖动大）时关闭校正，接受高延迟换连贯
+        this.correctionEnabled = !!d.enabled;
       } else if (d.cmd === 'bind-port') {
         // 接收从主线程转移进来的 MessagePort：worker 的 PCM 由此直达，主线程零参与
         this.dataPort = d.port;
@@ -32,7 +36,7 @@ class RingBufferProcessor extends AudioWorkletProcessor {
     // 深水位延迟校正（v0.7.5）：水位 >350ms 即丢回 200ms——稳态下到达=消耗速率，
     // 突发追赶的堆积无法自愈，音画长期偏移；与视频呈现的固定 150ms 目标配合，
     // 音画差可控制在 ±100ms 内。音频会有一次轻微跳跃
-    if (this.available > sampleRate * 0.35) {
+    if (this.correctionEnabled && this.available > sampleRate * 0.35) {
       const excess = this.available - Math.floor(sampleRate * 0.2);
       if (excess > 0) {
         this.readPos = (this.readPos + excess) % this.cap;

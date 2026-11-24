@@ -427,6 +427,8 @@
     let stallNotifyTimes = [];    // 10 分钟窗口内的上报时刻（≥5 次熔断：手机端采集正被系统反复中断时，
                                   // 反复重建投影会话会刺激系统进一步限流，越重启越糟）
     let lastCapHintAt = 0;        // 最近一次「已熔断」提示时刻
+    let audioCorrectTimes = [];   // 音频校正时刻（10s 窗口：频繁校正 = 链路抖动大，校正反而每秒切音频）
+    let audioCorrectEnabled = true; // 音频深水位校正开关（链路抖动风暴时自动关闭，接受高延迟换连贯）
     let stallEscalation = 0;      // 停摆自愈升级级别：1=已重建解码器 2=已重启会话（≥2 且仍停摆 → 刷新页面）
     let lastReloadAt = 0;         // 最近一次自刷新页面时刻（Date.now 基准，5 分钟限频防刷新循环）
     try { lastReloadAt = Number(sessionStorage.getItem('wl-auto-reload-at') || 0); } catch {}
@@ -754,7 +756,19 @@
           if (d.event === 'start') reportAudioState('环形缓冲起播（水位 150ms）');
           else if (d.event === 'underrun') reportAudioState('缓冲欠载一次（播放时钟保持连续，已自动接上）');
           else if (d.event === 'buffer') audioBufferMs = d.ms || 0; // 每秒水位上报：指标面板 + 音画同步目标
-          else if (d.event === 'buffer-correct') reportAudioState('音频延迟校正：丢弃 ' + (d.droppedMs || 0) + 'ms 旧数据以恢复同步（水位曾超 600ms，会有一次轻微跳跃）');
+          else if (d.event === 'buffer-correct') {
+            audioCorrectTimes.push(performance.now());
+            audioCorrectTimes = audioCorrectTimes.filter((t) => performance.now() - t < 10000);
+            if (audioCorrectTimes.length >= 3 && audioCorrectEnabled) {
+              // 校正风暴：水位反复冲高说明链路在批量投递（手机 Wi-Fi 省电模式典型行为），
+              // 每秒校正等于每秒切掉一段音频——停掉校正接受较高延迟换取连贯，并建议插 USB
+              audioCorrectEnabled = false;
+              try { audioWorkletNode && audioWorkletNode.port.postMessage({ cmd: 'set-correction', enabled: false }); } catch {}
+              reportAudioState('⚠ 音频校正过于频繁（链路抖动大，疑似手机 Wi-Fi 省电批量投递）：已停止校正，接受较高延迟换取连贯。建议插 USB 线彻底解决');
+            } else if (audioCorrectEnabled) {
+              reportAudioState('音频延迟校正：丢弃 ' + (d.droppedMs || 0) + 'ms 旧数据以恢复同步（水位曾超 350ms，会有一次轻微跳跃）');
+            }
+          }
           else if (d.event === 'bind-ack') workletBound = true;
         };
         audioWorkletNode.connect(audioGain);
