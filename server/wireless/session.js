@@ -402,6 +402,30 @@ class WirelessSession {
         attempt();
       });
 
+      // control=true（熄屏投屏）时：scrcpy 要等三条 socket 全部 accept 才开始编码出流，
+      // 视频/音频都没有首字节可等（用 openStream 会死锁，v0.7.8 实测永久卡 connecting）；
+      // 改为「连接成功且稳定 300ms」即视为建立（close/error 触发重试，语义一致）
+      const openChannel = (label) => new Promise((resolve, reject) => {
+        const deadline = Date.now() + 20000;
+        const attempt = () => {
+          if (!this.serverProc) { reject(new Error('scrcpy-server 启动失败或已退出')); return; }
+          const sock = net.connect(this.forwardPort, '127.0.0.1');
+          let stable = false;
+          const retry = (why) => {
+            if (stable) return;
+            sock.destroy();
+            if (Date.now() > deadline) reject(new Error(`${label}通道连接超时（${why}）`));
+            else setTimeout(attempt, 300);
+          };
+          sock.once('error', (err) => retry(err.message));
+          sock.once('close', () => retry('连接被关闭'));
+          sock.once('connect', () => {
+            setTimeout(() => { if (!stable) { stable = true; resolve(sock); } }, 300);
+          });
+        };
+        attempt();
+      });
+
       // --- 视频 socket：解析帧头，剥出 H.264 裸流转发（首个字节是哑字节，跳过）---
       const buffered = [];   // 状态切换为 streaming 之前缓冲视频数据
       let live = false;
@@ -425,7 +449,7 @@ class WirelessSession {
           }
         },
       });
-      const videoSocket = await openStream('视频', (chunk) => {
+      const handleVideoChunk = (chunk) => {
         let buf = chunk;
         if (!dummySkipped) {
           dummySkipped = true;
@@ -433,7 +457,12 @@ class WirelessSession {
           if (!buf.length) return;
         }
         videoReader.push(buf);
-      });
+      };
+      // control=true（熄屏）走 openChannel（不等首字节，避免三 socket 死锁），
+      // 否则走 openStream（等首字节确认，防 adb forward 假连接）
+      const videoSocket = wantScreenOff
+        ? await (async () => { const s = await openChannel('视频'); s.on('data', handleVideoChunk); return s; })()
+        : await openStream('视频', handleVideoChunk);
       this.videoSocket = videoSocket;
       videoSocket.once('close', () => {
         if (this.state === 'streaming') {
@@ -496,7 +525,10 @@ class WirelessSession {
         });
         let audioSock;
         try {
-          audioSock = await openStream('音频', (chunk) => audioReader.push(chunk));
+          // control=true 时同样不等首字节（死锁同视频，v0.7.8 实测）
+          audioSock = wantScreenOff
+            ? await (async () => { const s = await openChannel('音频'); s.on('data', (chunk) => audioReader.push(chunk)); return s; })()
+            : await openStream('音频', (chunk) => audioReader.push(chunk));
         } catch (err) {
           this.log('音频通道建立失败，继续仅视频投屏：' + err.message);
           logger.error('[audio] 通道建立失败：' + err.message);
@@ -519,30 +551,8 @@ class WirelessSession {
       // 控制通道是双向的，当前只接收不发送（剪贴板同步等设备→电脑消息，一律排空忽略）
       this.controlSocket = null;
       if (wantScreenOff) {
-        const openControlStream = () => new Promise((resolve, reject) => {
-          const deadline = Date.now() + 10000;
-          const attempt = () => {
-            if (!this.serverProc) { reject(new Error('scrcpy-server 启动失败或已退出')); return; }
-            const sock = net.connect(this.forwardPort, '127.0.0.1');
-            let stable = false;
-            const retry = () => {
-              if (stable) return;
-              sock.destroy();
-              if (Date.now() > deadline) reject(new Error('控制通道连接失败'));
-              else setTimeout(attempt, 300);
-            };
-            sock.once('error', (err) => retry(err.message));
-            sock.once('close', () => retry('连接被关闭'));
-            sock.once('connect', () => {
-              // adb forward 会先本地 accept、发现远端未就绪即断开：连接后稳定 300ms 才算建立
-              // （控制通道没有首字节可等，用存活时延代确认）
-              setTimeout(() => { stable = true; resolve(sock); }, 300);
-            });
-          };
-          attempt();
-        });
         try {
-          this.controlSocket = await openControlStream();
+          this.controlSocket = await openChannel('控制');
           this.controlSocket.on('data', () => {}); // 排空设备→电脑消息
           this.controlSocket.once('error', () => {}); // 断开不影响投屏（只损失熄屏后恢复时机）
           // scrcpy ≥2.x 的熄屏走控制消息：TYPE_SET_DISPLAY_POWER(10) + 1 字节布尔（0=熄屏）。
