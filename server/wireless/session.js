@@ -436,7 +436,12 @@ class WirelessSession {
       });
       this.videoSocket = videoSocket;
       videoSocket.once('close', () => {
-        if (this.state === 'streaming') this.stop('视频通道已断开');
+        if (this.state === 'streaming') {
+          if (this.screenOffSentAt && Date.now() - this.screenOffSentAt < 8000) {
+            this.log('⚠ 熄屏指令发出后通道立即断开：此 scrcpy 版本的熄屏协议不兼容，请取消勾选「熄屏投屏」后重试');
+          }
+          this.stop('视频通道已断开');
+        }
       });
       videoSocket.once('error', () => {
         if (this.state === 'streaming') this.stop('视频通道断开');
@@ -540,6 +545,13 @@ class WirelessSession {
           this.controlSocket = await openControlStream();
           this.controlSocket.on('data', () => {}); // 排空设备→电脑消息
           this.controlSocket.once('error', () => {}); // 断开不影响投屏（只损失熄屏后恢复时机）
+          // scrcpy ≥2.x 的熄屏走控制消息：TYPE_SET_DISPLAY_POWER(10) + 1 字节布尔（0=熄屏）。
+          // （v5.0.1 已移除 turn_screen_off 服务端参数，dex 字符串表确认控制枚举存在）
+          try {
+            this.controlSocket.write(Buffer.from([10, 0]));
+            this.screenOffSentAt = Date.now();
+            this.log('已发送熄屏指令（若 3 秒内画面不更新或会话断开，请取消勾选熄屏投屏——该版本协议可能不兼容）');
+          } catch {}
         } catch (err) {
           // 控制通道建不起来：scrcpy 会一直等 accept，编码器不会启动 → 整体失败比半残好
           throw err;
@@ -602,6 +614,10 @@ class WirelessSession {
     if (this.audioSocket) {
       try { this.audioSocket.destroy(); } catch {}
       this.audioSocket = null;
+    }
+    if (this.controlSocket && this.screenOffUsed) {
+      // 熄屏恢复亮屏：TYPE_SET_DISPLAY_POWER(10) + 1 = 亮屏（与 scrcpy 自身退出恢复、keyevent 三重保险）
+      try { this.controlSocket.write(Buffer.from([10, 1])); } catch {}
     }
     if (this.controlSocket) {
       try { this.controlSocket.destroy(); } catch {}

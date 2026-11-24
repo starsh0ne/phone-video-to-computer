@@ -19,6 +19,16 @@
 
 
 
+
+## [v0.7.8] - 2026-11-24
+
+### fix: 熄屏投屏改走控制消息（scrcpy-server 5.x 已移除 turn_screen_off 参数）
+
+- **实证**：scrcpy-server 5.0.1 的 dex 字符串表确认 `turn_screen_off` 服务端参数已移除（WARN Unknown server option），控制消息枚举存在 `TYPE_SET_DISPLAY_POWER`；`getSetDisplayPowerModeMethod`/`setDisplayPowerMode` 方法存在
+- **方案**：熄屏改走控制通道——控制 socket 建立后发送 `TYPE_SET_DISPLAY_POWER(10) + 1 字节布尔（0=熄屏）`；停止投屏时发送 `(10,1)` 恢复亮屏，另有 keyevent 224 唤醒与 scrcpy 自身恢复三重保险；熄屏指令发出后若通道 8s 内断开，日志明确提示「熄屏协议不兼容，请取消勾选」
+- **附带**：v0.7.5 遗漏的 videoEncoder 透传恢复（前次编辑误删，已核对）
+- **真机探测备注**：在线探测因「运行中的会话占用 localabstract 套接字 / 第二实例编码器被占」而不可行，改用离线 dex 解包分析（tools/analyze-server-options.js，可复用）
+- 44 项测试全过
 ## [v0.7.7] - 2026-11-24
 
 ### feat: USB 热切换——Wi-Fi 投屏中途插线自动迁移到 USB 链路
