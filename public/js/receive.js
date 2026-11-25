@@ -250,7 +250,6 @@
     let pending = [];            // 解码器就绪前缓存的数据
     let frameCount = 0, fpsTime = 0, fpsTimer = null;
     let wsState = 'idle';
-    let autoConnectTried = false;  // 每次页面会话只自动连接一次，避免死循环打扰
 
     /* ---------- Tab 切换 ---------- */
     const tabs = { 'tab-scan': 'scan-body', 'tab-wireless': 'wireless-body' };
@@ -1145,14 +1144,11 @@
             stopFps();
           }
         } else if (msg.type === 'last-connection') {
-          // 上次成功连接的地址：自动回填并尝试自动连接（仅空闲时，一次会话只自动试一次）
-          if (msg.addr && wsState === 'idle' && !autoConnectTried) {
-            autoConnectTried = true;
-            if (!$('wl-connect-addr').value.trim()) {
-              $('wl-connect-addr').value = msg.addr;
-              log('检测到上次连接的地址 ' + msg.addr + '，正在自动连接…');
-              ws.send(JSON.stringify({ type: 'connect', addr: msg.addr }));
-            }
+          // 上次无线连接地址：仅回填输入框（v0.8.3 起不再自动发起无线连接——
+          // USB 已连接时旧 IP 超时纯属浪费；USB 由服务端在新页面接入时自动检测连接）
+          if (msg.addr && wsState === 'idle' && !$('wl-connect-addr').value.trim()) {
+            $('wl-connect-addr').value = msg.addr;
+            log('已回填上次无线连接地址 ' + msg.addr + '（如需无线请点「无线连接」）');
           }
         } else if (msg.type === 'audio') {
           // 服务端音频通道状态通知（async 调用必须接 catch：否则初始化异常被 Promise 静默吞掉，日志零痕迹）
