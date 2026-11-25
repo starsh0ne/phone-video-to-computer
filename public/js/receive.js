@@ -1353,22 +1353,17 @@
       sendSafe({ type: 'connect-usb' });
       setStatus('正在检测 USB 设备…');
     };
-    // 恢复上次使用的画质档位与熄屏选项（页面自刷新兑底后自动续播也用它们）
+    // 恢复上次使用的画质档位。熄屏投屏不记忆（v0.8.4：用户反馈熄屏被自动发起）——
+    // 每次页面加载默认不勾选，需要时手动勾选
     try {
       const savedQ = localStorage.getItem('wl-quality');
       if (savedQ) { const qel = document.getElementById('wl-quality'); if (qel) qel.value = savedQ; }
-      if (localStorage.getItem('wl-screen-off') === '1') {
-        const so = document.getElementById('wl-screen-off');
-        if (so) so.checked = true;
-      }
     } catch {}
     $('wl-btn-start').onclick = () => {
       resetDecoder();
       // 画质档位 → scrcpy 参数：max_size 0 = 手机原始分辨率；码率越高越清晰（占带宽越多）
       const q = $('wl-quality') ? $('wl-quality').value : 'high';
-      try { localStorage.setItem('wl-quality', q); } catch {} // 持久化：页面自刷新兑底后自动续播用
-      const screenOff = !!document.getElementById('wl-screen-off')?.checked;
-      try { localStorage.setItem('wl-screen-off', screenOff ? '1' : '0'); } catch {}
+      const screenOff = !!document.getElementById('wl-screen-off')?.checked; // 仅本次会话生效，不记忆
       const presets = {
         high: { maxSize: 1920, bitrate: 16000000, maxFps: 60 },
         balanced: { maxSize: 1600, bitrate: 10000000, maxFps: 60 },

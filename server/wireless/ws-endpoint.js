@@ -59,24 +59,11 @@ function setupWireless(httpServer) {
         session.send(ws, session.lastAudioConfig);
       }
     }
-    // v0.8.3：自动连接只做 USB（插入数据线+开 USB 调试即自动就绪，无超时风险）；
-    // 无线地址仅下发供输入框回填，不再自动发起无线连接（旧 IP 失效时会白等 20s+ 超时）
+    // v0.8.3 的自动 USB 连接已按用户要求移除：USB 连接改为手动点击「USB 连接」按钮发起
     const last = connStore.load();
     if (last && session.state === 'idle') {
       session.send(ws, { type: 'last-connection', addr: last.addr, savedAt: last.savedAt });
     }
-    (async () => {
-      try {
-        if (session.state !== 'idle') return;
-        const adbPath = await session.ensureAdb();
-        const list = await adbapi.devices(adbPath);
-        const usb = list.find((s) => !adbapi.isWirelessSerial(s));
-        if (usb && session.state === 'idle') {
-          session.serial = usb;
-          session.setState('ready', '已通过 USB 自动连接：' + usb + '（最稳定链路，无需同一 Wi-Fi），可以开始投屏');
-        }
-      } catch { /* 工具链准备失败：等待用户手动操作 */ }
-    })();
     ws.on('message', (raw, isBinary) => {
       if (isBinary) return; // 本端点只收 JSON 控制消息
       let msg;
