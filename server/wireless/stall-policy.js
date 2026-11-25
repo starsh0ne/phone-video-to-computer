@@ -41,14 +41,25 @@ function planStallRestart({ stallTimes, options, now }) {
     return { restart: false, stallTimes: times, restartOpts: opts, messages };
   }
 
+  if (n >= 2 && opts.screenOff) {
+    // 实测（v0.7.9 真机）：熄屏状态下 vivo 显示管线 ~50s 后停止渲染（比亮屏的 ~90s 更快），
+    // 与编码器类型/传输介质无关 → 第一优先级对策：关闭熄屏、点亮手机屏幕重试
+    opts.screenOff = false;
+    messages.push(
+      '⚠ 熄屏投屏下视频停滞（实测 vivo 熄屏后显示管线约 1 分钟内停止渲染）：' +
+      '已自动关闭熄屏并点亮手机屏幕重试；若不想手机亮屏，仅能接受周期性自动重启'
+    );
+    return { restart: true, stallTimes: times, restartOpts: opts, messages };
+  }
+
   if (n >= 2 && !opts.videoEncoder) {
     opts.videoEncoder = SOFTWARE_ENCODER;
     opts.bitrate = Math.min(opts.bitrate || 6000000, 6000000);
     opts.maxFps = 30;
     messages.push(
-      '⚠ 视频流再次停滞：疑似手机硬件编码器被系统冻结（USB/Wi-Fi 均同现，与码率无关），' +
-      '已切换软件编码器（更稳，帧率降至 30fps）。若软件编码器仍频繁停滞，则vivo 在挂起整个采集会话，' +
-      '建议检查手机省电/权限策略或插拔重试'
+      '⚠ 视频流再次停滞：疑似手机硬件编码器/采集路径被系统冻结（USB/Wi-Fi 均同现，与码率无关），' +
+      '已切换软件编码器（更稳，帧率降至 30fps）。若软件编码器仍频繁停滞，则 vivo 在挂起整个采集会话，' +
+      '建议检查手机省电/隐私权限策略'
     );
   }
 

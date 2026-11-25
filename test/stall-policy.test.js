@@ -38,6 +38,15 @@ test('第 2 次停滞：直接切换软件编码器 + 30fps + 6Mbps（实测码�
   assert.ok(r.messages[0].includes('软件编码器'));
 });
 
+test('熄屏投屏下停滞：第 2 次优先关闭熄屏+点亮屏幕（vivo 熄屏 ~50s 停渲染实测），不切软编', () => {
+  const r = run(2, { bitrate: 16000000, maxSize: 1920, maxFps: 60, screenOff: true });
+  assert.strictEqual(r.restart, true);
+  assert.strictEqual(r.restartOpts.screenOff, false);
+  assert.strictEqual(r.restartOpts.videoEncoder, undefined);
+  assert.strictEqual(r.restartOpts.bitrate, 16000000);
+  assert.ok(r.messages[0].includes('熄屏'));
+});
+
 test('阶梯只升不降：第 3 次停滞（已是软件编码器）仅重启不改参数', () => {
   const r = run(3, { bitrate: 6000000, maxSize: 1920, maxFps: 30, videoEncoder: 'c2.android.avc.encoder' });
   assert.strictEqual(r.restart, true);

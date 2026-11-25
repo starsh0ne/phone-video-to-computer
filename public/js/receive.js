@@ -764,7 +764,7 @@
               // 每秒校正等于每秒切掉一段音频——停掉校正接受较高延迟换取连贯，并建议插 USB
               audioCorrectEnabled = false;
               try { audioWorkletNode && audioWorkletNode.port.postMessage({ cmd: 'set-correction', enabled: false }); } catch {}
-              reportAudioState('⚠ 音频校正过于频繁（链路抖动大，疑似手机 Wi-Fi 省电批量投递）：已停止校正，接受较高延迟换取连贯。建议插 USB 线彻底解决');
+              reportAudioState('⚠ 音频校正过于频繁（手机端数据批量投递，链路抖动大）：已停止校正，接受较高延迟换取连贯');
             } else if (audioCorrectEnabled) {
               reportAudioState('音频延迟校正：丢弃 ' + (d.droppedMs || 0) + 'ms 旧数据以恢复同步（水位曾超 350ms，会有一次轻微跳跃）');
             }
