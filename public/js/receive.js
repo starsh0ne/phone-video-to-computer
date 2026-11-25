@@ -765,7 +765,7 @@
               try { audioWorkletNode && audioWorkletNode.port.postMessage({ cmd: 'set-correction', enabled: false }); } catch {}
               reportAudioState('⚠ 音频校正过于频繁（手机端数据批量投递，链路抖动大）：已停止校正，接受较高延迟换取连贯');
             } else if (audioCorrectEnabled) {
-              reportAudioState('音频延迟校正：丢弃 ' + (d.droppedMs || 0) + 'ms 旧数据以恢复同步（水位曾超 350ms，会有一次轻微跳跃）');
+              reportAudioState('音频延迟校正：丢弃 ' + (d.droppedMs || 0) + 'ms 旧数据以恢复同步（单次突发水位超 700ms 的兑底，会有一次轻微跳跃）');
             }
           }
           else if (d.event === 'bind-ack') workletBound = true;

@@ -33,10 +33,9 @@ class RingBufferProcessor extends AudioWorkletProcessor {
     };
   }
   writeRing(data, n) {
-    // 深水位延迟校正（v0.7.5）：水位 >350ms 即丢回 200ms——稳态下到达=消耗速率，
-    // 突发追赶的堆积无法自愈，音画长期偏移；与视频呈现的固定 150ms 目标配合，
-    // 音画差可控制在 ±100ms 内。音频会有一次轻微跳跃
-    if (this.correctionEnabled && this.available > sampleRate * 0.35) {
+    // 灾难性堆积兑底（v0.8.6）：单次突发把水位顶到 >700ms 时一次性丢回 450ms。
+    // 日常延迟收敛由 process() 的渐进 drain 负责（无跳感），此处仅处理极端情况
+    if (this.correctionEnabled && this.available > sampleRate * 0.7) {
       const excess = this.available - Math.floor(sampleRate * 0.2);
       if (excess > 0) {
         this.readPos = (this.readPos + excess) % this.cap;
@@ -70,6 +69,13 @@ class RingBufferProcessor extends AudioWorkletProcessor {
         L.fill(0); R.fill(0);
         return true;
       }
+    }
+    // 深水位渐进收敛（v0.8.6）：水位 >170ms 时每回调多消耗 1 帧（≈0.8% 加速，听感不可闻），
+    // 把突发堆积的多余延迟平滑排干（约 30 秒收敛回 ~160ms）——
+    // 此前一次性丢弃有跳感、风暴熔断后水位永久卡死（实测水位卡 553ms）
+    if (this.playing && this.available > sampleRate * 0.17 + n) {
+      this.readPos = (this.readPos + 1) % this.cap;
+      this.available--;
     }
     let got = 0;
     if (this.available >= n) {
