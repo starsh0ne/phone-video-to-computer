@@ -87,7 +87,11 @@ function setupWireless(httpServer) {
           session.cancelQrPairing();
           break;
         case 'connect':
-          session.connect(msg.addr || '').catch(reply);
+          session.connect(msg.addr || '', msg.mode === 'usb' ? 'usb' : 'wireless').catch(reply);
+          break;
+        case 'connect-usb':
+          // USB 直连：无需 IP/端口，无需同一网络，数据走数据线（v0.8.0）
+          session.connectUsb().catch(reply);
           break;
         case 'start':
           session.start({

@@ -1350,8 +1350,12 @@
     };
     $('wl-btn-connect').onclick = () => {
       const addr = $('wl-connect-addr').value.trim();
-      sendSafe({ type: 'connect', addr });
-      setStatus('正在连接…');
+      sendSafe({ type: 'connect', addr, mode: 'wireless' }); // 无线按钮：仅无线发现，不降级到 USB
+      setStatus('正在无线连接…');
+    };
+    $('wl-btn-usb').onclick = () => {
+      sendSafe({ type: 'connect-usb' });
+      setStatus('正在检测 USB 设备…');
     };
     // 恢复上次使用的画质档位与熄屏选项（页面自刷新兑底后自动续播也用它们）
     try {

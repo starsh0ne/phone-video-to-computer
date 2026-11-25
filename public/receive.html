@@ -95,10 +95,14 @@
       <button class="wl-btn" id="wl-btn-pair">② 配对码配对</button>
 
       <div class="field" style="border-top:1px dashed var(--line);padding-top:12px">
-        <label>连接地址：无线调试主界面显示的 IP:端口（已配对过可直接连接）</label>
+        <label>无线连接地址：无线调试主界面显示的 IP:端口（留空则自动发现无线设备）</label>
         <input id="wl-connect-addr" placeholder="例如 192.168.137.182:37555，留空自动发现" autocomplete="off">
       </div>
-      <button class="wl-btn" id="wl-btn-connect">连 接</button>
+      <div style="display:flex;gap:8px">
+        <button class="wl-btn" id="wl-btn-connect" style="flex:1">无线连接</button>
+        <button class="wl-btn" id="wl-btn-usb" style="flex:1;background:var(--accent);color:#fff" title="手机数据线连接电脑并打开「USB 调试」即可，无需 IP、无需同一 Wi-Fi">USB 连接</button>
+      </div>
+      <div class="wl-steps" style="padding:6px 0 0">USB 连接：数据线连电脑 + 开「USB 调试」即可，无需 IP，不受 Wi-Fi 频段/省电影响（最稳定）。</div>
       <div class="field" style="margin-top:10px">
         <label>画质（全屏观看建议选高清或原生）</label>
         <select id="wl-quality" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:inherit">

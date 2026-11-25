@@ -218,8 +218,8 @@ class WirelessSession {
     this.setState('idle', reason);
   }
 
-  /* ---------- 连接 ---------- */
-  async connect(addr) {
+  /* ---------- 连接（无线） ---------- */
+  async connect(addr, mode = 'wireless') {
     if (this.state === 'streaming') throw new Error('投屏中，请先停止当前投屏');
     try {
       this.setState('connecting', '正在连接手机…');
@@ -237,7 +237,7 @@ class WirelessSession {
       if (addr) {
         this.log('地址 ' + addr + ' 连接失败（' + (err.message || err) + '），自动发现当前地址…');
         try {
-          if (await this.tryAutoConnect(2)) return;
+          if (await this.tryAutoConnect(2, mode === 'auto' ? 'auto' : 'wireless')) return;
         } catch { /* 发现也失败：抛出原错误 */ }
       }
       this.setState('idle', '连接失败');
@@ -245,20 +245,39 @@ class WirelessSession {
     }
   }
 
-  /** 通过 USB 直连 / mDNS / 已连接设备自动发现并连接；postPair 时轮询多次（配对后 adb 自动连接需要几秒） */
-  async tryAutoConnect(attempts = 1) {
+  /* ---------- 连接（USB 直连：无需 IP/端口，无需与电脑同一网络，数据走数据线） ---------- */
+  async connectUsb() {
+    if (this.state === 'streaming') throw new Error('投屏中，请先停止当前投屏');
+    this.setState('connecting', '正在检测 USB 设备…');
+    const adbPath = await this.ensureAdb();
+    const list = await adbapi.devices(adbPath);
+    const usb = list.find((s) => !adbapi.isWirelessSerial(s));
+    if (!usb) {
+      this.setState('idle', '未检测到 USB 设备');
+      throw new Error('未检测到 USB 设备：请确认 ① 数据线已连接且手机 USB 模式选「传输文件」 ② 开发者选项中「USB 调试」已打开 ③ 手机弹窗「允许 USB 调试」已点允许');
+    }
+    this.serial = usb;
+    this.setState('ready', '已通过 USB 连接：' + usb + '（最稳定链路，无需同一 Wi-Fi），可以开始投屏');
+  }
+
+  /** 通过 USB 直连 / mDNS / 已连接设备自动发现并连接；postPair 时轮询多次（配对后 adb 自动连接需要几秒）
+   *  mode：'wireless'=仅无线（默认，配对/无线重试用）；'usb'=仅 USB；'auto'=USB 优先再无线 */
+  async tryAutoConnect(attempts = 1, mode = 'wireless') {
     for (let i = 0; i < attempts; i++) {
       if (i > 0) await new Promise((r) => setTimeout(r, 1500));
       try {
         const adbPath = this.adbPath;
-        // 1. USB 直连设备优先（插入数据线即用，绕开无线链路全部不稳定性）
+        // 1. USB 直连设备优先（仅 auto/usb 模式；插入数据线即用，绕开无线链路全部不稳定性）
         const list = await adbapi.devices(adbPath);
-        const usb = list.find((s) => !adbapi.isWirelessSerial(s));
-        if (usb) {
-          this.serial = usb;
-          this.setState('ready', '已通过 USB 连接：' + usb + '（最稳定链路），可以开始投屏');
-          return true;
+        if (mode === 'usb' || mode === 'auto') {
+          const usb = list.find((s) => !adbapi.isWirelessSerial(s));
+          if (usb) {
+            this.serial = usb;
+            this.setState('ready', '已通过 USB 连接：' + usb + '（最稳定链路，无需同一 Wi-Fi），可以开始投屏');
+            return true;
+          }
         }
+        if (mode === 'usb') return false; // 明确只要 USB：不降级到无线
         // 2. mDNS 发现无线调试服务
         const services = await adbapi.mdnsServicesDetailed(adbPath);
         for (const s of services) {
@@ -301,8 +320,9 @@ class WirelessSession {
       const adbPath = await this.ensureAdb();
 
       if (!this.serial) {
-        const ok = await this.tryAutoConnect();
-        if (!ok) throw new Error('尚未连接手机：请先配对并连接');
+        // 未先连接就点开始：USB 优先，其次无线自动发现
+        const ok = await this.tryAutoConnect(1, 'auto');
+        if (!ok) throw new Error('尚未连接手机：请插线后点「USB 连接」，或无线配对后点「无线连接」');
       }
       const serial = this.serial;
 
