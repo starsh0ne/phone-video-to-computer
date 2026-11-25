@@ -94,6 +94,7 @@ function setupWireless(httpServer) {
           session.connectUsb().catch(reply);
           break;
         case 'start':
+          session.stallTimes = []; // 手动重新开始投屏：重置降载阶梯（自动重启链路不清空，阶梯才能升级）
           session.start({
             bitrate: msg.bitrate,
             maxSize: msg.maxSize,

@@ -4,9 +4,9 @@
  * 输入：10 分钟窗口内的停滞时刻数组 + 当前开流参数，输出：是否重启、新参数、要广播的消息。
  * 阶梯（每级只升不降，手动停止后重新开始投屏即重置）：
  *   10 分钟内第 1 次  → 仅重启会话（秒级恢复）
- *   ≥ 2 次           → 码率降 25%（下限 6Mbps）
- *   ≥ 3 次           → 切换 Android 自带软件编码器 c2.android.avc.encoder + 30fps
- *                      （绕开 vivo 等厂商硬件编码器被系统冻结/出错的机型问题）
+ *   ≥ 2 次           → 切换 Android 自带软件编码器 c2.android.avc.encoder + 30fps + 6Mbps
+ *                      （实测：停滞在 Wi-Fi 与 USB 传输上同等出现且码率无关——是 vivo 硬件
+ *                      编码器/投影路径被系统冻结，降码率无效，直接换软件编码器）
  *   > 5 次           → 熔断：暂停自动重启。反复重建 MediaProjection 会话会刺激
  *                      vivo 等系统进一步限流，越重启越糟；提示用户手动介入
  */
@@ -41,19 +41,14 @@ function planStallRestart({ stallTimes, options, now }) {
     return { restart: false, stallTimes: times, restartOpts: opts, messages };
   }
 
-  if (n >= 3 && !opts.videoEncoder) {
+  if (n >= 2 && !opts.videoEncoder) {
     opts.videoEncoder = SOFTWARE_ENCODER;
     opts.bitrate = Math.min(opts.bitrate || 6000000, 6000000);
     opts.maxFps = 30;
     messages.push(
-      '⚠ 10 分钟内停滞 ' + n + ' 次：疑似手机硬件编码器问题，已切换软件编码器（更稳，帧率降至 30fps）。' +
-      '若软件编码器仍频繁停滞，建议手机插线投屏（USB 连接最稳）或检查手机省电策略'
-    );
-  } else if (n >= 2 && opts.bitrate && opts.bitrate > 6000000) {
-    opts.bitrate = Math.max(6000000, Math.floor(opts.bitrate * 0.75));
-    messages.push(
-      '⚠ 视频流频繁停滞，已自动降低码率至 ' + (opts.bitrate / 1e6).toFixed(1) +
-      ' Mbps（停止后重选画质档可恢复）'
+      '⚠ 视频流再次停滞：疑似手机硬件编码器被系统冻结（USB/Wi-Fi 均同现，与码率无关），' +
+      '已切换软件编码器（更稳，帧率降至 30fps）。若软件编码器仍频繁停滞，则vivo 在挂起整个采集会话，' +
+      '建议检查手机省电/权限策略或插拔重试'
     );
   }
 

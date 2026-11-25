@@ -29,15 +29,8 @@ test('第 1 次停滞：仅重启，参数不变', () => {
   assert.strictEqual(r.messages.length, 0);
 });
 
-test('第 2 次停滞：码率降 25%（16M → 12M）', () => {
+test('第 2 次停滞：直接切换软件编码器 + 30fps + 6Mbps（实测码率降级无效，跳过）', () => {
   const r = run(2);
-  assert.strictEqual(r.restart, true);
-  assert.strictEqual(r.restartOpts.bitrate, 12000000);
-  assert.ok(r.messages[0].includes('12.0 Mbps'));
-});
-
-test('第 3 次停滞：切换软件编码器 + 30fps + 码率压到 6M', () => {
-  const r = run(3);
   assert.strictEqual(r.restart, true);
   assert.strictEqual(r.restartOpts.videoEncoder, 'c2.android.avc.encoder');
   assert.strictEqual(r.restartOpts.maxFps, 30);
@@ -45,8 +38,8 @@ test('第 3 次停滞：切换软件编码器 + 30fps + 码率压到 6M', () => 
   assert.ok(r.messages[0].includes('软件编码器'));
 });
 
-test('阶梯只升不降：第 4 次停滞保持软件编码器，不再改参数', () => {
-  const r = run(4, { bitrate: 6000000, maxSize: 1920, maxFps: 30, videoEncoder: 'c2.android.avc.encoder' });
+test('阶梯只升不降：第 3 次停滞（已是软件编码器）仅重启不改参数', () => {
+  const r = run(3, { bitrate: 6000000, maxSize: 1920, maxFps: 30, videoEncoder: 'c2.android.avc.encoder' });
   assert.strictEqual(r.restart, true);
   assert.strictEqual(r.restartOpts.videoEncoder, 'c2.android.avc.encoder');
   assert.strictEqual(r.restartOpts.bitrate, 6000000);

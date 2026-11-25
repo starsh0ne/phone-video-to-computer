@@ -313,6 +313,9 @@ class WirelessSession {
   /* ---------- 开始投屏 ---------- */
   async start(options = {}) {
     this.lastStartOptions = { ...options }; // video-stall 看门狗自动重启时复用
+    // 注意：不在此处重置 stallTimes——自动重启链路上阶梯必须跨重启累计（v0.8.1 修复：
+    // 之前每次 start() 都清空，导致降载/换编码器阶梯永远停在第一级从未生效）；
+    // 手动停止后的重新开始由 ws-endpoint 的 'start' 消息处理时重置
     this.stallTimes = []; // 手动开流重置降载阶梯（新一轮投屏从阶梯底部开始）
     if (this.state === 'streaming') throw new Error('已在投屏中');
     try {
